@@ -36,4 +36,4 @@ EXPOSE $PORT
 
 # Define the command to run your application using Gunicorn
 # Railway automatically uses the PORT variable
-CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "audioProcessingService:app"]
+CMD sh -c 'gunicorn --bind 0.0.0.0:$PORT audioProcessingService:app'
