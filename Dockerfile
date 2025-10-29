@@ -7,7 +7,7 @@ RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libportaudio2 \
-    python3.11-dev \
+    python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set the working directory in the container
@@ -31,7 +31,9 @@ RUN pip install --no-cache-dir \
 COPY . .
 
 # Expose the port your Flask app will run on
+# Railway provides the PORT environment variable automatically
 EXPOSE $PORT
 
 # Define the command to run your application using Gunicorn
+# Railway automatically uses the PORT variable
 CMD ["gunicorn", "--bind", "0.0.0.0:$PORT", "audioProcessingService:app"]
