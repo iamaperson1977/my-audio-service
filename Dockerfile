@@ -1,12 +1,12 @@
-# Use a Python base image with a specific version
-FROM python:3.11-slim-buster
+# Use a Python base image with a specific version (non-slim)
+FROM python:3.11
 
 # Install necessary system dependencies for audio processing libraries (ffmpeg, build tools)
-# Removed libportaudio2 temporarily
 RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
     libsndfile1 \
+    libportaudio2 \
     python3.11-dev \
     && rm -rf /var/lib/apt/lists/*
 
