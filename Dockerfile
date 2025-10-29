@@ -32,7 +32,7 @@ COPY . .
 
 # Expose the port your Flask app will run on
 # Railway provides the PORT environment variable automatically
-EXPOSE $PORT
+
 
 # Define the command to run your application using Gunicorn
 # Railway automatically uses the PORT variable
