@@ -2,12 +2,11 @@
 FROM python:3.11-slim-buster
 
 # Install necessary system dependencies for audio processing libraries (ffmpeg, build tools)
-# This is crucial for numpy, scipy, librosa, pydub
+# Removed libportaudio2 temporarily
 RUN apt-get update --fix-missing && apt-get install -y --no-install-recommends \
     build-essential \
     ffmpeg \
     libsndfile1 \
-    libportaudio2 \
     python3.11-dev \
     && rm -rf /var/lib/apt/lists/*
 
