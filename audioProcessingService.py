@@ -2,56 +2,31 @@ import os
 import uuid
 import numpy as np
 import soundfile as sf
-# Use specific imports from scipy.signal for clarity
 from scipy.signal import butter, sosfilt, sosfiltfilt, tf2sos, iirpeak, iirnotch
-from scipy import signal # Keep for potential other uses
+from scipy import signal
 import logging
 from pydub import AudioSegment
-import librosa # Keep, may be needed by demucs dependencies
+import librosa
 import tempfile
 import shutil
-import numba # <-- IMPORT IS HERE
+import numba
 import subprocess
 import sys
-import json # For parsing instructions
+import json
 import atexit
-import base64 # <-- NEW IMPORT, GOOD
-import threading # <-- NEW IMPORT for Async
-import requests  # <-- NEW IMPORT for Callback
+import base64
+import threading
+import requests
 
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-# Enhanced logging format for better debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Use temp directory for better cleanup
 UPLOAD_FOLDER = tempfile.mkdtemp(prefix='audio_uploads_')
 OUTPUT_FOLDER = tempfile.mkdtemp(prefix='audio_outputs_')
 logging.info(f"Using UPLOAD_FOLDER: {UPLOAD_FOLDER}")
 logging.info(f"Using OUTPUT_FOLDER: {OUTPUT_FOLDER}")
-
-# ==================== HELPER FUNCTIONS ====================
-
-def check_audio_level(audio_data, label="Audio"):
-    """Log audio level information for debugging."""
-    if not isinstance(audio_data, np.ndarray) or audio_data.size == 0:
-        logging.warning(f"{label}: EMPTY OR INVALID ARRAY")
-        return 0.0, 0.0 # Return zeros for safety
-    
-    try:
-        rms = np.sqrt(np.mean(audio_data.astype(np.float64)**2)) # Use float64 for mean calculation stability
-        peak = np.max(np.abs(audio_data))
-        
-        logging.info(f"{label} - RMS: {rms:.6f}, Peak: {peak:.6f}, Shape: {audio_data.shape}, dtype: {audio_data.dtype}")
-        
-        if peak < 1e-5: # Use a small threshold for near silence
-            logging.warning(f"{label}: AUDIO IS SILENT OR NEARLY SILENT!")
-        
-        return rms, peak
-    except Exception as e:
-        logging.error(f"Error in check_audio_level for {label}: {e}")
-        return 0.0, 0.0
 
 # ==================== FILE FORMAT HANDLING ====================
 
@@ -67,7 +42,6 @@ def convert_to_wav(input_path, output_path):
         logging.error(f"Conversion error: {e}")
         return False
 
-
 def read_wav(filepath):
     """Reads WAV file into NumPy array."""
     try:
@@ -77,7 +51,6 @@ def read_wav(filepath):
     except Exception as e:
         logging.error(f"Error reading WAV: {e}")
         return None, None
-
 
 def write_wav(filepath, audio_data, sample_rate):
     """Writes NumPy array to WAV file."""
@@ -94,7 +67,7 @@ def write_wav(filepath, audio_data, sample_rate):
         logging.error(f"Error writing WAV: {e}")
         return False
 
-# ==================== DSP FUNCTIONS (High Quality) ====================
+# ==================== DSP FUNCTIONS ====================
 
 @numba.jit(nopython=True)
 def _gate_channel(audio_channel, threshold_linear, attack_coeff, release_coeff, ratio):
@@ -170,7 +143,6 @@ def apply_parametric_eq(audio_data, sample_rate, frequency, gain_db, q_factor=1.
         if filter_type == 'peak':
             b0 = 1 + alpha * A; b1 = -2 * np.cos(w0); b2 = 1 - alpha * A
             a0 = 1 + alpha / A; a1 = -2 * np.cos(w0); a2 = 1 - alpha / A
-        
         elif filter_type == 'lowshelf':
             b0 = A * ((A + 1) - (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha)
             b1 = 2 * A * ((A - 1) - (A + 1) * np.cos(w0))
@@ -178,7 +150,6 @@ def apply_parametric_eq(audio_data, sample_rate, frequency, gain_db, q_factor=1.
             a0 = (A + 1) + (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha
             a1 = -2 * ((A - 1) + (A + 1) * np.cos(w0))
             a2 = (A + 1) + (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha
-        
         elif filter_type == 'highshelf':
             b0 = A * ((A + 1) + (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha)
             b1 = -2 * A * ((A - 1) + (A + 1) * np.cos(w0))
@@ -186,21 +157,17 @@ def apply_parametric_eq(audio_data, sample_rate, frequency, gain_db, q_factor=1.
             a0 = (A + 1) - (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha
             a1 = 2 * ((A - 1) - (A + 1) * np.cos(w0))
             a2 = (A + 1) - (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha
-        
         elif filter_type == 'lowpass':
             b0 = (1 - np.cos(w0)) / 2; b1 = 1 - np.cos(w0); b2 = (1 - np.cos(w0)) / 2
             a0 = 1 + alpha; a1 = -2 * np.cos(w0); a2 = 1 - alpha
-        
         elif filter_type == 'highpass':
             b0 = (1 + np.cos(w0)) / 2; b1 = -(1 + np.cos(w0)); b2 = (1 + np.cos(w0)) / 2
             a0 = 1 + alpha; a1 = -2 * np.cos(w0); a2 = 1 - alpha
-        
         elif filter_type == 'notch':
             b0 = 1; b1 = -2 * np.cos(w0); b2 = 1
             a0 = 1 + alpha; a1 = -2 * np.cos(w0); a2 = 1 - alpha
-        
         else:
-            logging.warning(f"Unknown EQ filter type: {filter_type}, skipping.")
+            logging.warning(f"Unknown filter type: {filter_type}, skipping.")
             return audio_data
         
         sos = np.array([[b0/a0, b1/a0, b2/a0, 1, a1/a0, a2/a0]])
@@ -212,7 +179,6 @@ def apply_parametric_eq(audio_data, sample_rate, frequency, gain_db, q_factor=1.
             for ch in range(audio_data.shape[1]):
                 result[:, ch] = sosfiltfilt(sos, audio_data[:, ch])
             return result.astype(np.float32)
-    
     except Exception as e:
         logging.error(f"Parametric EQ error: {e}")
         return audio_data
@@ -220,9 +186,9 @@ def apply_parametric_eq(audio_data, sample_rate, frequency, gain_db, q_factor=1.
 
 @numba.jit(nopython=True)
 def compress_channel(audio_channel, threshold_linear, ratio, attack_coeff, release_coeff, knee_db, makeup_gain_linear):
-    """Optimized compression with soft knee (Corrected dB logic)."""
-    envelope_db = -100.0 # Track envelope in dB
-    gain_smooth = 1.0 # Track gain smoothing factor
+    """Optimized compression with soft knee."""
+    envelope_db = -100.0
+    gain_smooth = 1.0
     output = np.zeros_like(audio_channel)
     inv_ratio_minus_one = (1.0 / ratio) - 1.0
     threshold_db = 20.0 * np.log10(threshold_linear)
@@ -239,10 +205,8 @@ def compress_channel(audio_channel, threshold_linear, ratio, attack_coeff, relea
         overshoot_db = envelope_db - threshold_db
 
         if knee_db > 0 and abs(overshoot_db) <= knee_width_db_half:
-            # Inside soft knee
             gain_reduction_db = inv_ratio_minus_one * ((overshoot_db + knee_width_db_half)**2) / (2.0 * knee_db)
         elif overshoot_db > knee_width_db_half:
-            # Above hard knee
             gain_reduction_db = inv_ratio_minus_one * overshoot_db
 
         target_gain = 10.0**(gain_reduction_db / 20.0)
@@ -283,7 +247,6 @@ def apply_compressor(audio_data, sample_rate, threshold_db=-20, ratio=4.0, attac
             for ch in range(audio_data.shape[1]):
                 output[:, ch] = compress_channel(audio_data[:, ch], threshold_linear, ratio, attack_coeff, release_coeff, knee_db, makeup_gain_linear)
             return output.astype(np.float32)
-    
     except Exception as e:
         logging.error(f"Compressor error: {e}")
         return audio_data
@@ -302,9 +265,9 @@ def limit_channel(audio_channel, threshold_linear, release_coeff):
             target_gain = threshold_linear / max(abs_sample, 1e-10)
         
         if target_gain < gain:
-            gain = target_gain # Instant attack
+            gain = target_gain
         else:
-            gain = release_coeff * gain + (1.0 - release_coeff) * target_gain # Release
+            gain = release_coeff * gain + (1.0 - release_coeff) * target_gain
         
         output[i] = sample * gain
     
@@ -330,7 +293,6 @@ def apply_limiter(audio_data, sample_rate, threshold_db=-1.0, release_ms=50):
             for ch in range(audio_data.shape[1]):
                 output[:, ch] = limit_channel(audio_data[:, ch], threshold_linear, release_coeff)
             return output.astype(np.float32)
-    
     except Exception as e:
         logging.error(f"Limiter error: {e}")
         return audio_data
@@ -355,10 +317,12 @@ def _deesser_channel(audio_channel, hf_env, threshold_linear, ratio, attack_coef
         output[i] = audio_channel[i] * gain_reduction
     return output
 
+
 def apply_deesser(audio_data, sample_rate, frequency=6000, threshold_db=-15, ratio=3, attack_ms=1, release_ms=10):
     """De-esser for controlling harsh sibilance."""
     try:
-        if audio_data.size == 0: return audio_data
+        if audio_data.size == 0:
+            return audio_data
         frequency = np.clip(frequency, 2000, 12000)
         threshold_db = np.clip(threshold_db, -40, 0)
         ratio = np.clip(ratio, 1, 10)
@@ -381,34 +345,31 @@ def apply_deesser(audio_data, sample_rate, frequency=6000, threshold_db=-15, rat
         logging.error(f"De-esser error: {e}")
         return audio_data
 
+
 def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
     """Normalize audio to target LUFS (approximate)."""
     try:
-        if audio_data.size == 0: return audio_data
+        if audio_data.size == 0:
+            return audio_data
         target_lufs = np.clip(target_lufs, -30, -5)
         
-        # Use librosa for a much more accurate RMS (closer to perceptual loudness)
-        # Note: This is still a very rough approximation of LUFS.
         rms = librosa.feature.rms(y=audio_data, frame_length=2048, hop_length=512)[0]
         avg_rms = np.mean(rms)
         
         if avg_rms < 1e-10:
-             logging.warning("Audio is silent, skipping loudness normalization")
-             return audio_data
+            logging.warning("Audio is silent, skipping normalization.")
+            return audio_data
 
-        current_lufs_approx = 20 * np.log10(avg_rms) + 10.0 # Heuristic offset
-        
+        current_lufs_approx = 20 * np.log10(avg_rms) + 10.0
         gain_db = target_lufs - current_lufs_approx
         gain_db = np.clip(gain_db, -24, 24)
         gain_linear = 10 ** (gain_db / 20)
         
         normalized = audio_data * gain_linear
-        # Apply a final limiter, not just a clip
         normalized = apply_limiter(normalized, sample_rate, threshold_db=-1.0)
         
         logging.info(f"Normalized: {current_lufs_approx:.1f} LUFS (approx) -> {target_lufs:.1f} LUFS (gain: {gain_db:.1f} dB)")
         return normalized.astype(np.float32)
-    
     except Exception as e:
         logging.error(f"Loudness normalization error: {e}")
         return audio_data
@@ -423,13 +384,13 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
         
         subprocess.run([
             sys.executable, '-m', 'demucs.separate',
-            '-n', 'htdemucs_ft', # <-- Using high-quality model
+            '-n', 'htdemucs_ft',
             '-o', output_dir,
             '--mp3',
             '--mp3-bitrate', '192',
             '--jobs', '2',
             wav_path
-        ], check=True, capture_output=True, text=True, timeout=840) # 14 minute timeout
+        ], check=True, capture_output=True, text=True, timeout=840)
         
         logging.info(f"✅ Demucs complete for {wav_path}")
         
@@ -464,21 +425,21 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
 
         logging.info("🎉 Stem separation complete! Calling back to Deno...")
         
-        # --- Use passed-in API Key for callback ---
         callback_headers = {
             "Authorization": f"Bearer {base44_api_key}",
             "Base44-App-Id": base44_app_id,
             "Content-Type": "application/json"
         }
-        callback_data = {
-            "success": True,
-            "project_id": project_id,
-            "stems_base64": stems_data
-        }
-
+        
+        logging.info(f"🔐 Sending callback with Auth headers to: {callback_url}")
+        
         callback_response = requests.post(
             callback_url, 
-            json=callback_data, 
+            json={
+                "success": True,
+                "project_id": project_id,
+                "stems_base64": stems_data
+            }, 
             headers=callback_headers, 
             timeout=60
         )
@@ -490,7 +451,6 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
     
     except Exception as e:
         logging.error(f"❌ Async processing error: {e}", exc_info=True)
-        # --- Use passed-in API Key for ERROR callback ---
         try:
             callback_headers = {
                 "Authorization": f"Bearer {base44_api_key}",
@@ -506,7 +466,6 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
             logging.error(f"❌ Failed to send error callback: {callback_e}")
     
     finally:
-        # Cleanup
         try:
             if input_path_to_clean and os.path.exists(input_path_to_clean):
                 os.remove(input_path_to_clean)
@@ -518,12 +477,10 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
         except Exception as cleanup_e:
             logging.error(f"Error during async cleanup: {cleanup_e}", exc_info=True)
 
+
 @app.route('/separate_stems', methods=['POST'])
 def separate_stems():
-    """
-    Separates audio into stems using demucs.
-    NOW ASYNC: Accepts job, responds immediately, then processes and calls back.
-    """
+    """Separates audio into stems using demucs."""
     input_path = None
     wav_path = None
     output_dir = None
@@ -534,11 +491,10 @@ def separate_stems():
         
         file = request.files['file']
         
-        # --- FIX: Get auth details from Base44 request FORM DATA ---
         callback_url = request.form.get('callback_url')
         project_id = request.form.get('project_id')
-        base44_api_key = request.form.get('base44_api_key') # Base44 Deno must send this
-        base44_app_id = request.form.get('base44_app_id')     # Base44 Deno must send this
+        base44_api_key = request.form.get('base44_api_key')
+        base44_app_id = request.form.get('base44_app_id')
         
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
@@ -562,20 +518,18 @@ def separate_stems():
             if not convert_to_wav(input_path, wav_path):
                 raise ValueError("Failed to convert input to WAV")
         else:
-            shutil.copy(input_path, wav_path) # Use copy to be safe
+            shutil.copy(input_path, wav_path)
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # RESPOND IMMEDIATELY - Job accepted
         logging.info(f"✅ Job accepted for project {project_id}. Starting background processing...")
         
-        # Start background processing in a thread
         thread = threading.Thread(
             target=process_stems_async,
             args=(
                 wav_path, output_dir, callback_url, project_id, 
-                base44_api_key, base44_app_id, # Pass auth details
-                input_path, wav_path, output_dir # Pass paths for cleanup
+                base44_api_key, base44_app_id,
+                input_path, wav_path, output_dir
             )
         )
         thread.daemon = True
@@ -585,11 +539,10 @@ def separate_stems():
             "success": True,
             "message": "Stem separation job started",
             "project_id": project_id
-        }), 202  # 202 Accepted
+        }), 202
     
     except Exception as e:
         logging.error(f"❌ Job acceptance error: {e}", exc_info=True)
-        # Cleanup on immediate failure
         try:
             if input_path and os.path.exists(input_path):
                 os.remove(input_path)
@@ -604,13 +557,14 @@ def separate_stems():
 
 
 # ==================== MAIN PROCESSING ====================
+
 @app.route('/process', methods=['POST'])
 def process_audio():
     """Process a single audio stem with AI decisions."""
     input_path = None
     wav_path = None
     processed_wav_path = None
-    unique_id = str(uuid.uuid4()) # Added for logging
+    unique_id = str(uuid.uuid4())
     
     try:
         if 'file' not in request.files:
@@ -640,7 +594,7 @@ def process_audio():
             if not convert_to_wav(input_path, wav_path):
                 raise ValueError("Failed to convert to WAV")
         else:
-            wav_path = input_path # Use original file if already WAV
+            wav_path = input_path
         
         audio_data, sample_rate = read_wav(wav_path)
         if audio_data is None:
@@ -652,19 +606,18 @@ def process_audio():
         logging.info(f"🎵 Starting DSP processing: SR={sample_rate}, Shape={audio_data.shape}")
         current_audio = audio_data.copy()
         
-        # --- Helper to get params ---
         def get_params(phase_name, effect_name):
-             return ai_decisions.get(phase_name, {}).get(effect_name, {})
+            return ai_decisions.get(phase_name, {}).get(effect_name, {})
 
         # RESTORATION
         if ai_decisions.get('restoration'):
             logging.info("🧹 Applying RESTORATION effects...")
             params = get_params('restoration', 'noise_reduction')
             if params and params.get('apply', False):
-                 current_audio = apply_noise_gate(current_audio,
-                     threshold_db=params.get('threshold_db', -60),
-                     ratio=params.get('ratio', 10),
-                     sample_rate=sample_rate)
+                current_audio = apply_noise_gate(current_audio,
+                    threshold_db=params.get('threshold_db', -60),
+                    ratio=params.get('ratio', 10),
+                    sample_rate=sample_rate)
 
             params = get_params('restoration', 'deessing')
             if params and params.get('apply', False):
@@ -685,22 +638,24 @@ def process_audio():
 
             eq_params = get_params('mixing', 'equalizer')
             if eq_params and 'bands' in eq_params and isinstance(eq_params['bands'], list):
-                 logging.info(f"Applying {len(eq_params['bands'])} EQ bands...")
-                 for band in eq_params['bands'][:8]: # Limit bands
-                     if isinstance(band, dict) and band.get('apply', True):
-                         current_audio = apply_parametric_eq(current_audio,
-                             sample_rate=sample_rate,
-                             frequency=band.get('frequency', 1000),
-                             gain_db=band.get('gain_db', 0),
-                             q_factor=band.get('q_factor', 1.0),
-                             filter_type=band.get('type', 'peak'))
+                logging.info(f"Applying {len(eq_params['bands'])} EQ bands...")
+                for band in eq_params['bands'][:8]:
+                    if isinstance(band, dict) and band.get('apply', True):
+                        current_audio = apply_parametric_eq(current_audio,
+                            sample_rate=sample_rate,
+                            frequency=band.get('frequency', 1000),
+                            gain_db=band.get('gain_db', 0),
+                            q_factor=band.get('q_factor', 1.0),
+                            filter_type=band.get('type', 'peak'))
             
             comp_params = get_params('mixing', 'compression')
             if comp_params and comp_params.get('apply', False):
                 ratio_val = 4.0
                 ratio_str = comp_params.get('ratio', '4:1')
-                try: ratio_val = float(ratio_str.split(':')[0])
-                except: pass
+                try:
+                    ratio_val = float(ratio_str.split(':')[0])
+                except:
+                    ratio_val = 4.0
                 current_audio = apply_compressor(current_audio,
                     sample_rate=sample_rate,
                     threshold_db=comp_params.get('threshold_db', -18),
@@ -724,9 +679,8 @@ def process_audio():
                     threshold_db=limit_params.get('ceiling_db', -0.5),
                     release_ms=limit_params.get('release_ms', 50))
             else:
-                 current_audio = apply_limiter(current_audio, sample_rate=sample_rate, threshold_db=-0.5)
+                current_audio = apply_limiter(current_audio, sample_rate=sample_rate, threshold_db=-0.5)
 
-        
         current_audio = np.clip(current_audio, -1.0, 1.0)
 
         if not write_wav(processed_wav_path, current_audio, sample_rate):
@@ -743,7 +697,6 @@ def process_audio():
         logging.error(f"❌ Processing error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
     finally:
-        # Clean up temporary files and directories
         try:
             if input_path and os.path.exists(input_path):
                 os.remove(input_path)
@@ -761,12 +714,13 @@ def health_check():
     """Health check."""
     return jsonify({"status": "healthy", "service": "AI Studio Pro"}), 200
 
+
 @app.route('/', methods=['GET'])
 def root():
     """Root."""
     return jsonify({
         "service": "AI Studio Pro Audio Processing",
-        "version": "4.0.0", # <-- Version bump for new auth
+        "version": "4.0.0",
         "optimizations": "Async demucs, base64 data transfer, callback auth",
         "endpoints": {
             "POST /separate_stems": "Separate audio into stems, returns 202, calls back with base64 data",
@@ -775,22 +729,8 @@ def root():
         }
     }), 200
 
-# Helper function for cleanup on error
-def cleanup_temp_dirs_on_error(unique_id, *paths):
-    logging.warning(f"Request {unique_id}: Cleaning up temp files due to error...")
-    cleaned_count = 0
-    for p in paths:
-        if p and os.path.exists(p):
-            try:
-                os.remove(p)
-                logging.info(f"Request {unique_id}: Cleaned up errored file: {os.path.basename(p)}")
-                cleaned_count += 1
-            except Exception as e:
-                logging.error(f"Request {unique_id}: Error cleaning up errored file {os.path.basename(p)}: {e}")
-    logging.warning(f"Request {unique_id}: Error cleanup finished. Removed {cleaned_count} files.")
 
 if __name__ == '__main__':
-    # Register cleanup for when the Flask app exits
     def cleanup_temp_dirs():
         for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
             if os.path.exists(folder):
@@ -802,7 +742,6 @@ if __name__ == '__main__':
 
     atexit.register(cleanup_temp_dirs)
     
-    # Run the Flask app
     port = int(os.environ.get("PORT", 5000))
     logging.info(f"Starting Flask server on host 0.0.0.0, port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
