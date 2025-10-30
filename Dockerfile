@@ -37,3 +37,5 @@ COPY . .
 # Define the command to run your application using Gunicorn
 # Railway automatically uses the PORT variable
 CMD sh -c 'gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 audioProcessingService:app'
+
+
