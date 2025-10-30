@@ -62,5 +62,5 @@ COPY . .
 # - Sets a worker timeout of 120 seconds for potentially long audio processing (like demucs)
 # - Starts with 1 worker (can be adjusted based on server resources and load)
 # - Assumes your Flask app instance is named 'app' in 'audioProcessingService.py'
-CMD sh -c 'gunicorn --bind 0.0.0.0:$PORT --timeout 120 --workers 1 audioProcessingService:app'
+CMD sh -c 'gunicorn --bind 0.0.0.0:$PORT --timeout 900 --workers 1 audioProcessingService:app'
 
