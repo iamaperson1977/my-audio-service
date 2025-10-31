@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import atexit
 import requests
+import threading
 from flask import Flask, request, jsonify
 import torch
 
@@ -45,93 +46,10 @@ def cleanup_temp_dirs():
 
 atexit.register(cleanup_temp_dirs)
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint"""
-    logger.info('❤️ Health check requested')
-    return jsonify({
-        'status': 'healthy',
-        'service': 'audio-processing-stem-separation-only',
-        'upload_folder': UPLOAD_FOLDER,
-        'output_folder': OUTPUT_FOLDER,
-        'cuda_available': torch.cuda.is_available()
-    })
-
-@app.route('/separate_stems', methods=['POST'])
-def separate_stems():
-    """
-    SIMPLIFIED: ONLY SEPARATES STEMS, NOTHING ELSE
-    """
-    job_id = str(uuid.uuid4())[:8]
-    
-    logger.info('=' * 80)
-    logger.info(f"🎵 [{job_id}] NEW STEM SEPARATION JOB STARTED")
-    logger.info('=' * 80)
-    
+def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_service_key):
+    """Background worker function"""
     try:
-        # Log all form data
-        logger.debug(f"📦 [{job_id}] Form data keys: {list(request.form.keys())}")
-        logger.debug(f"📦 [{job_id}] Files: {list(request.files.keys())}")
-        
-        # Get form data
-        if 'file' not in request.files:
-            logger.error(f"❌ [{job_id}] No file in request")
-            return jsonify({'error': 'No file provided'}), 400
-        
-        file = request.files['file']
-        logger.info(f"📄 [{job_id}] File received: {file.filename}")
-        logger.info(f"📊 [{job_id}] File content type: {file.content_type}")
-        
-        callback_url = request.form.get('callback_url')
-        project_id = request.form.get('project_id')
-        base44_service_key = request.form.get('base44_service_key')
-        
-        logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
-        logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
-        logger.info(f"🔑 [{job_id}] Service key received: {bool(base44_service_key)}")
-        
-        if not callback_url or not project_id:
-            logger.error(f"❌ [{job_id}] Missing required parameters")
-            logger.error(f"   callback_url: {callback_url}")
-            logger.error(f"   project_id: {project_id}")
-            return jsonify({'error': 'Missing callback_url or project_id'}), 400
-        
-        # Save uploaded file
-        input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input{os.path.splitext(file.filename)[1]}")
-        logger.info(f"💾 [{job_id}] Saving file to: {input_path}")
-        file.save(input_path)
-        
-        file_size = os.path.getsize(input_path)
-        logger.info(f"✅ [{job_id}] File saved successfully")
-        logger.info(f"📊 [{job_id}] File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
-        
-        # Convert to WAV if needed
-        wav_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input.wav")
-        if not input_path.endswith('.wav'):
-            logger.info(f"🔄 [{job_id}] Converting to WAV...")
-            logger.debug(f"🔄 [{job_id}] FFmpeg command: ffmpeg -i {input_path} -ar 44100 -ac 2 -y {wav_path}")
-            
-            result = subprocess.run([
-                'ffmpeg', '-i', input_path, '-ar', '44100', '-ac', '2', '-y', wav_path
-            ], capture_output=True, text=True)
-            
-            logger.debug(f"📤 [{job_id}] FFmpeg stdout: {result.stdout}")
-            logger.debug(f"📤 [{job_id}] FFmpeg stderr: {result.stderr}")
-            
-            if result.returncode != 0:
-                logger.error(f"❌ [{job_id}] FFmpeg conversion failed")
-                logger.error(f"   Return code: {result.returncode}")
-                logger.error(f"   Stderr: {result.stderr}")
-                raise Exception(f"FFmpeg conversion failed: {result.stderr}")
-            
-            logger.info(f"✅ [{job_id}] Conversion complete")
-        else:
-            logger.info(f"📋 [{job_id}] File already WAV, copying...")
-            shutil.copy(input_path, wav_path)
-            logger.info(f"✅ [{job_id}] File copied")
-        
-        wav_size = os.path.getsize(wav_path)
-        logger.info(f"📊 [{job_id}] WAV file size: {wav_size} bytes ({wav_size / 1024 / 1024:.2f} MB)")
+        logger.info(f"🎸 [{job_id}] Background worker started")
         
         # Run Demucs stem separation
         logger.info('=' * 80)
@@ -280,15 +198,9 @@ def separate_stems():
         logger.info(f"🎉 [{job_id}] JOB COMPLETED SUCCESSFULLY")
         logger.info('=' * 80)
         
-        return jsonify({
-            'success': True,
-            'project_id': project_id,
-            'message': 'Stem separation complete'
-        })
-    
     except Exception as e:
         logger.error('=' * 80)
-        logger.error(f"❌ [{job_id}] FATAL ERROR")
+        logger.error(f"❌ [{job_id}] FATAL ERROR IN BACKGROUND WORKER")
         logger.error('=' * 80)
         logger.error(f"Error type: {type(e).__name__}")
         logger.error(f"Error message: {str(e)}")
@@ -314,7 +226,113 @@ def separate_stems():
                 logger.info(f"✅ [{job_id}] Failure notification sent")
         except Exception as callback_error:
             logger.error(f"❌ [{job_id}] Failed to notify callback: {callback_error}")
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    logger.info('❤️ Health check requested')
+    return jsonify({
+        'status': 'healthy',
+        'service': 'audio-processing-stem-separation-only',
+        'upload_folder': UPLOAD_FOLDER,
+        'output_folder': OUTPUT_FOLDER,
+        'cuda_available': torch.cuda.is_available()
+    })
+
+@app.route('/separate_stems', methods=['POST'])
+def separate_stems():
+    """
+    ASYNC: Accepts file, returns immediately, processes in background
+    """
+    job_id = str(uuid.uuid4())[:8]
+    
+    logger.info('=' * 80)
+    logger.info(f"🎵 [{job_id}] NEW STEM SEPARATION JOB STARTED")
+    logger.info('=' * 80)
+    
+    try:
+        # Log all form data
+        logger.debug(f"📦 [{job_id}] Form data keys: {list(request.form.keys())}")
+        logger.debug(f"📦 [{job_id}] Files: {list(request.files.keys())}")
         
+        # Get form data
+        if 'file' not in request.files:
+            logger.error(f"❌ [{job_id}] No file in request")
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        logger.info(f"📄 [{job_id}] File received: {file.filename}")
+        logger.info(f"📊 [{job_id}] File content type: {file.content_type}")
+        
+        callback_url = request.form.get('callback_url')
+        project_id = request.form.get('project_id')
+        base44_service_key = request.form.get('base44_service_key')
+        
+        logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
+        logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
+        logger.info(f"🔑 [{job_id}] Service key received: {bool(base44_service_key)}")
+        
+        if not callback_url or not project_id:
+            logger.error(f"❌ [{job_id}] Missing required parameters")
+            logger.error(f"   callback_url: {callback_url}")
+            logger.error(f"   project_id: {project_id}")
+            return jsonify({'error': 'Missing callback_url or project_id'}), 400
+        
+        # Save uploaded file
+        input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input{os.path.splitext(file.filename)[1]}")
+        logger.info(f"💾 [{job_id}] Saving file to: {input_path}")
+        file.save(input_path)
+        
+        file_size = os.path.getsize(input_path)
+        logger.info(f"✅ [{job_id}] File saved successfully")
+        logger.info(f"📊 [{job_id}] File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
+        
+        # Convert to WAV if needed
+        wav_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input.wav")
+        if not input_path.endswith('.wav'):
+            logger.info(f"🔄 [{job_id}] Converting to WAV...")
+            
+            result = subprocess.run([
+                'ffmpeg', '-i', input_path, '-ar', '44100', '-ac', '2', '-y', wav_path
+            ], capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                logger.error(f"❌ [{job_id}] FFmpeg conversion failed")
+                raise Exception(f"FFmpeg conversion failed: {result.stderr}")
+            
+            logger.info(f"✅ [{job_id}] Conversion complete")
+        else:
+            logger.info(f"📋 [{job_id}] File already WAV, copying...")
+            shutil.copy(input_path, wav_path)
+            logger.info(f"✅ [{job_id}] File copied")
+        
+        # Start background thread
+        thread = threading.Thread(
+            target=process_job_async,
+            args=(job_id, input_path, wav_path, callback_url, project_id, base44_service_key)
+        )
+        thread.daemon = True
+        thread.start()
+        
+        logger.info(f"✅ [{job_id}] Background job started, returning immediately")
+        logger.info('=' * 80)
+        logger.info(f"📤 [{job_id}] RETURNING SUCCESS TO CLIENT")
+        logger.info('=' * 80)
+        
+        # Return immediately
+        return jsonify({
+            'success': True,
+            'project_id': project_id,
+            'message': 'Stem separation started in background'
+        })
+    
+    except Exception as e:
+        logger.error('=' * 80)
+        logger.error(f"❌ [{job_id}] FATAL ERROR")
+        logger.error('=' * 80)
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.exception(f"Full traceback:")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
@@ -323,8 +341,6 @@ if __name__ == '__main__':
     logger.info(f"🚀 Starting Flask server on port {port}")
     logger.info('=' * 80)
     app.run(host='0.0.0.0', port=port, debug=False)
-
-
 
 
 
