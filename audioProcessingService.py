@@ -2,7 +2,7 @@ import os
 import uuid
 import numpy as np
 import soundfile as sf
-from scipy.signal import butter, sosfilt, sosfiltfilt, tf2sos, iirpeak, iirnotch
+from scipy.signal import butter, sosfilt, sosfiltfilt, lfilter
 from scipy import signal
 import logging
 from pydub import AudioSegment
@@ -24,7 +24,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 UPLOAD_FOLDER = tempfile.mkdtemp(prefix='audio_uploads_')
-OUTPUT_FOLDER = tempfile.mkdtemp(prefix='audio_outputs_')
+OUTPUT_FOLDER = tempfile.mkdtemp(prefix="audio_outputs_")
 logging.info(f"Using UPLOAD_FOLDER: {UPLOAD_FOLDER}")
 logging.info(f"Using OUTPUT_FOLDER: {OUTPUT_FOLDER}")
 
@@ -375,42 +375,10 @@ def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
         return audio_data
 
 
-# ==================== BASE44 FILE UPLOAD HELPER ====================
+# ==================== STEM SEPARATION (ASYNC + BASE64 RETURN) ====================
 
-def upload_file_to_base44(file_path, filename, base44_service_key, base44_app_id):
-    """Upload a file directly to Base44 storage using their API."""
-    try:
-        logging.info(f"☁️ Uploading {filename} to Base44 storage...")
-        
-        # Base44 integrations API endpoint
-        base44_api_url = f"https://api.base44.com/v1/apps/{base44_app_id}/integrations/Core/UploadFile"
-        
-        with open(file_path, 'rb') as f:
-            files = {'file': (filename, f, 'audio/mpeg')}
-            headers = {
-                'Authorization': f'Bearer {base44_service_key}'
-            }
-            
-            response = requests.post(base44_api_url, files=files, headers=headers, timeout=120)
-        
-        if response.status_code >= 200 and response.status_code < 300:
-            result = response.json()
-            file_url = result.get('file_url')
-            logging.info(f"✅ Uploaded {filename}: {file_url[:50]}...")
-            return file_url
-        else:
-            logging.error(f"❌ Base44 upload failed: {response.status_code} - {response.text}")
-            return None
-            
-    except Exception as e:
-        logging.error(f"❌ Error uploading {filename} to Base44: {e}", exc_info=True)
-        return None
-
-
-# ==================== STEM SEPARATION (ASYNC + DIRECT UPLOAD) ====================
-
-def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_api_key, base44_app_id, base44_service_key, input_path_to_clean, wav_path_to_clean, output_dir_to_clean):
-    """Background processing function that calls back when done."""
+def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_api_key, base44_app_id, input_path_to_clean, wav_path_to_clean, output_dir_to_clean):
+    """Background processing function that calls back when done - RETURNS BASE64."""
     try:
         logging.info(f"🎵 Running demucs with HIGH QUALITY settings (htdemucs_ft) for {wav_path}...")
         
@@ -441,32 +409,27 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
         
         logging.info(f"Stems located in: {stem_track_dir}")
 
-        # Upload stems directly to Base44 storage
-        logging.info("☁️ Uploading stems directly to Base44 storage...")
-        stems_urls = {}
+        # Encode stems as BASE64 (OLD WORKING METHOD)
+        logging.info("📦 Encoding stems as base64...")
+        stems_base64 = {}
         for stem_name in ['vocals', 'drums', 'bass', 'other']:
             stem_file_path = os.path.join(stem_track_dir, f"{stem_name}.mp3")
             if os.path.exists(stem_file_path):
-                file_url = upload_file_to_base44(
-                    stem_file_path, 
-                    f"{stem_name}.mp3",
-                    base44_service_key,
-                    base44_app_id
-                )
-                if file_url:
-                    stems_urls[stem_name] = file_url
-                else:
-                    logging.warning(f"⚠️ Failed to upload {stem_name}.mp3")
+                with open(stem_file_path, 'rb') as f:
+                    stem_bytes = f.read()
+                    stem_base64 = base64.b64encode(stem_bytes).decode('utf-8')
+                    stems_base64[stem_name] = stem_base64
+                    logging.info(f"✅ Encoded {stem_name}.mp3 ({len(stem_bytes)} bytes)")
             else:
                 logging.warning(f"⚠️ Missing {stem_name}.mp3 at {stem_file_path}")
         
-        if not stems_urls:
-            raise ValueError("No stems were successfully uploaded to Base44")
+        if not stems_base64:
+            raise ValueError("No stems were successfully encoded")
 
-        logging.info(f"✅ Successfully uploaded {len(stems_urls)} stems to Base44")
-        logging.info("🎉 Stem separation and upload complete! Calling back to Deno...")
+        logging.info(f"✅ Successfully encoded {len(stems_base64)} stems")
+        logging.info("🎉 Stem separation and encoding complete! Calling back to Deno...")
         
-        # Send callback with URLs only (not base64 data)
+        # Send callback with BASE64 DATA (not URLs)
         callback_headers = {
             "Authorization": f"Bearer {base44_api_key}",
             "Base44-App-Id": base44_app_id,
@@ -476,10 +439,10 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
         callback_payload = {
             "success": True,
             "project_id": project_id,
-            "stems_urls": stems_urls  # URLs instead of base64
+            "stems_base64": stems_base64  # BASE64 data instead of URLs
         }
         
-        logging.info(f"📤 Sending callback with stems URLs: {list(stems_urls.keys())}")
+        logging.info(f"📤 Sending callback with base64 stems: {list(stems_base64.keys())}")
         
         callback_response = requests.post(
             callback_url, 
@@ -545,20 +508,18 @@ def separate_stems():
         project_id = request.form.get('project_id')
         base44_api_key = request.form.get('base44_api_key')
         base44_app_id = request.form.get('base44_app_id')
-        base44_service_key = request.form.get('base44_service_key')
         
         logging.info(f"📦 project_id: {project_id}")
         logging.info(f"📦 callback_url: {callback_url}")
         logging.info(f"🔑 api_key present: {bool(base44_api_key)}")
         logging.info(f"🆔 app_id present: {bool(base44_app_id)}")
-        logging.info(f"🔑 service_key present: {bool(base44_service_key)}")
         
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
         
-        if not all([callback_url, project_id, base44_api_key, base44_app_id, base44_service_key]):
+        if not all([callback_url, project_id, base44_api_key, base44_app_id]):
             logging.error(f"Missing required form fields")
-            return jsonify({"error": "Missing required fields: callback_url, project_id, base44_api_key, base44_app_id, or base44_service_key"}), 400
+            return jsonify({"error": "Missing required fields: callback_url, project_id, base44_api_key, or base44_app_id"}), 400
         
         unique_id = str(uuid.uuid4())
         filename_parts = file.filename.rsplit('.', 1)
@@ -585,7 +546,7 @@ def separate_stems():
             target=process_stems_async,
             args=(
                 wav_path, output_dir, callback_url, project_id, 
-                base44_api_key, base44_app_id, base44_service_key,
+                base44_api_key, base44_app_id,
                 input_path, wav_path, output_dir
             )
         )
@@ -612,8 +573,6 @@ def separate_stems():
         
         return jsonify({"error": str(e)}), 500
 
-
-# ... keep existing code (process, health, root endpoints and main block) ...
 
 @app.route('/process', methods=['POST'])
 def process_audio():
@@ -777,10 +736,10 @@ def root():
     """Root."""
     return jsonify({
         "service": "AI Studio Pro Audio Processing",
-        "version": "5.0.0",
-        "optimizations": "Direct file upload to Base44, URL-based callbacks",
+        "version": "5.0.0 - RESTORED WORKING ARCHITECTURE",
+        "architecture": "Python encodes base64, Deno uploads to Base44",
         "endpoints": {
-            "POST /separate_stems": "Separate audio into stems, upload to Base44, callback with URLs",
+            "POST /separate_stems": "Separate audio into stems, returns base64 to callback",
             "POST /process": "Process audio with AI DSP, returns base64 encoded WAV",
             "GET /health": "Health check"
         }
