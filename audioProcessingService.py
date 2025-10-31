@@ -83,7 +83,7 @@ def upload_file_to_base44(file_path, filename, base44_service_key, base44_app_id
             }
             
             logging.info(f"📤 Sending POST request to {base44_api_url}...")
-            response = requests.post(base44_api_url, files=files, headers=headers, timeout=120)
+            response = requests.post(base44_api_url, files=files, headers=headers, timeout=12000)
         
         if response.status_code >= 200 and response.status_code < 300:
             result = response.json()
@@ -483,7 +483,7 @@ def process_stems_async(input_path, callback_url, project_id, service_key, app_i
         # Run Demucs
         result = subprocess.run([
             'demucs', '--two-stems=vocals', '-o', OUTPUT_FOLDER, input_path
-        ], capture_output=True, text=True, timeout=300)
+        ], capture_output=True, text=True, timeout=6000)
         
         if result.returncode != 0:
             raise Exception(f"Demucs failed: {result.stderr}")
@@ -656,6 +656,7 @@ def cleanup():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=False)
+
 
 
 
