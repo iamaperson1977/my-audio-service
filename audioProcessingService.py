@@ -4,26 +4,25 @@ import numpy as np
 import soundfile as sf
 # Use specific imports from scipy.signal for clarity
 from scipy.signal import butter, sosfilt, sosfiltfilt, tf2sos, iirpeak, iirnotch
-from scipy import signal
+from scipy import signal # Keep for potential other uses
 import logging
 from pydub import AudioSegment
-import librosa
+import librosa # Keep, may be needed by demucs dependencies
 import tempfile
 import shutil
-import numba 
+import numba # <-- IMPORT IS HERE
 import subprocess
 import sys
-import json 
+import json # For parsing instructions
 import atexit
-import base64 
-import threading 
-import requests  
-# --- CRITICAL FIX: ADDED MISSING IMPORT ---
-from scipy.signal import lfilter 
+import base64 # <-- NEW IMPORT, GOOD
+import threading # <-- NEW IMPORT for Async
+import requests  # <-- NEW IMPORT for Callback
 
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+# Enhanced logging format for better debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Setup directories
@@ -71,33 +70,36 @@ def write_wav(filepath, audio_data, sample_rate):
         logging.error(f"Error writing WAV: {e}")
         return False
 
-# ==================== BASE44 FILE UPLOAD HELPER (FROM BASE44) ====================
+# ==================== BASE44 FILE UPLOAD HELPER ====================
 
-def upload_file_to_base44(file_path, filename, service_key, app_id):
-    """Upload file to Base44 storage using service role."""
+def upload_file_to_base44(file_path, filename, base44_service_key, base44_app_id):
+    """Upload a file directly to Base44 storage using their API."""
     try:
+        logging.info(f"☁️ Uploading {filename} to Base44 storage...")
+        
+        # Base44 integrations API endpoint
+        base44_api_url = f"https://api.base44.com/v1/apps/{base44_app_id}/integrations/Core/UploadFile"
+        
         with open(file_path, 'rb') as f:
-            files = {'file': (filename, f, 'audio/mpeg')}
+            files = {'file': (filename, f, 'audio/mpeg')} 
             headers = {
-                'Authorization': f'Bearer {service_key}',
-                'Base44-App-Id': app_id
+                'Authorization': f'Bearer {base44_service_key}'
             }
-            response = requests.post(
-                f'https://app.base44.com/api/integrations/Core/UploadFile',
-                files=files,
-                headers=headers,
-                timeout=120
-            )
             
-            if response.status_code == 200:
-                result = response.json()
-                logging.info(f"✅ Base44 Upload Successful: {result.get('file_url')}")
-                return result.get('file_url')
-            else:
-                logging.error(f"Upload failed: {response.status_code} - {response.text}")
-                return None
+            logging.info(f"📤 Sending POST request to {base44_api_url}...")
+            response = requests.post(base44_api_url, files=files, headers=headers, timeout=120)
+        
+        if response.status_code >= 200 and response.status_code < 300:
+            result = response.json()
+            file_url = result.get('file_url')
+            logging.info(f"✅ Uploaded {filename}: {file_url[:50]}...")
+            return file_url
+        else:
+            logging.error(f"❌ Base44 upload failed: {response.status_code} - {response.text}")
+            return None
+            
     except Exception as e:
-        logging.error(f"Upload error: {e}")
+        logging.error(f"❌ Error uploading {filename} to Base44: {e}", exc_info=True)
         return None
 
 # ==================== DSP FUNCTIONS (FINAL WORKING SET) ====================
@@ -336,8 +338,7 @@ def apply_limiter(audio_data, sample_rate, threshold_db=-1.0, release_ms=50):
         logging.error(f"Limiter error: {e}")
         return audio_data
 
-
-# This is the non-numba version that is SLOW but WORKS
+# --- THIS IS THE SLOW, BUT WORKING, DE-ESSER ---
 def _deesser_channel_py(audio_channel, b_detect, a_detect, b_process, a_process, threshold_linear, reduction_linear, attack_coeff, release_coeff):
     """Pure-python core logic for de-esser on a single channel."""
     detect_signal = lfilter(b_detect, a_detect, audio_channel)
@@ -371,7 +372,6 @@ def apply_deesser(audio_data, sample_rate, frequency=6000, threshold_db=-15, rat
         frequency = np.clip(frequency, 2000, 12000)
         threshold_db = np.clip(threshold_db, -40, 0)
         ratio = np.clip(ratio, 1, 10)
-        reduction_db = np.clip(reduction_db, 0, 24)
         
         threshold_linear = 10 ** (threshold_db / 20)
         reduction_linear = 1.0 / ratio # Use ratio for reduction
@@ -433,7 +433,7 @@ def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
         normalized = audio_data * gain_linear
         normalized = apply_limiter(normalized, sample_rate, threshold_db=-1.0)
         
-        logging.info(f"Normalized: {current_lufs_approx:.1f} LUFS (approx) -> {target_lufs:.1f} LUFS (gain: {gain_db:.1f} dB)")
+        logging.info(f"Normalized: {current_lufs_approx:.1f} LUFS -> {target_lufs:.1f} LUFS (gain: {gain_db:.1f} dB)")
         return normalized.astype(np.float32)
     except Exception as e:
         logging.error(f"Loudness normalization error: {e}")
