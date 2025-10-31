@@ -17,9 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application
 COPY audioProcessingService.py .
 
-# Expose port
-EXPOSE 5000
+# Expose port (Railway will use $PORT)
+EXPOSE $PORT
 
-# Run with gunicorn
-CMD ["gunicorn", "-w", "4", "-b", "0.0.0.0:5000", "--timeout", "300", "audioProcessingService:app"]
-
+# Run with gunicorn using Railway's PORT
+CMD gunicorn -w 4 -b 0.0.0.0:$PORT --timeout 300 audioProcessingService:app
