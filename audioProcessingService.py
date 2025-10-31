@@ -4,28 +4,26 @@ import numpy as np
 import soundfile as sf
 # Use specific imports from scipy.signal for clarity
 from scipy.signal import butter, sosfilt, sosfiltfilt, tf2sos, iirpeak, iirnotch
-from scipy import signal # Keep for potential other uses
+from scipy import signal
 import logging
 from pydub import AudioSegment
-import librosa # Keep, may be needed by demucs dependencies
+import librosa
 import tempfile
 import shutil
-import numba # <-- IMPORT IS HERE
+import numba 
 import subprocess
 import sys
-import json # For parsing instructions
+import json 
 import atexit
-import base64 # <-- NEW IMPORT, GOOD
-import threading # <-- NEW IMPORT for Async
-import requests  # <-- NEW IMPORT for Callback
+import base64 
+import threading 
+import requests 
 
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-# Enhanced logging format for better debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Setup directories
 UPLOAD_FOLDER = tempfile.mkdtemp(prefix='audio_uploads_')
 OUTPUT_FOLDER = tempfile.mkdtemp(prefix="audio_outputs_")
 logging.info(f"Using UPLOAD_FOLDER: {UPLOAD_FOLDER}")
@@ -77,14 +75,11 @@ def upload_file_to_base44(file_path, filename, base44_service_key, base44_app_id
     try:
         logging.info(f"☁️ Uploading {filename} to Base44 storage...")
         
-        # Base44 integrations API endpoint
         base44_api_url = f"https://api.base44.com/v1/apps/{base44_app_id}/integrations/Core/UploadFile"
         
         with open(file_path, 'rb') as f:
             files = {'file': (filename, f, 'audio/mpeg')} 
-            headers = {
-                'Authorization': f'Bearer {base44_service_key}'
-            }
+            headers = {'Authorization': f'Bearer {base44_service_key}'}
             
             logging.info(f"📤 Sending POST request to {base44_api_url}...")
             response = requests.post(base44_api_url, files=files, headers=headers, timeout=120)
@@ -340,22 +335,64 @@ def apply_limiter(audio_data, sample_rate, threshold_db=-1.0, release_ms=50):
 
 
 @numba.jit(nopython=True)
-def _deesser_channel(audio_channel, hf_env, threshold_linear, ratio, attack_coeff, release_coeff):
-    """De-esser core logic."""
-    gain_reduction = 1.0
-    output = np.zeros_like(audio_channel)
-    for i in range(len(audio_channel)):
-        detection = abs(hf_env[i])
-        target_gain = 1.0
-        if detection > threshold_linear:
-            overshoot = detection - threshold_linear
-            compressed_overshoot = overshoot / ratio
-            target_gain = (threshold_linear + compressed_overshoot) / detection
-        if target_gain < gain_reduction:
-            gain_reduction = attack_coeff * gain_reduction + (1.0 - attack_coeff) * target_gain
-        else:
-            gain_reduction = release_coeff * gain_reduction + (1.0 - release_coeff) * target_gain
-        output[i] = audio_channel[i] * gain_reduction
+def _deesser_channel(audio_channel, b_detect, a_detect, b_process, a_process, threshold_linear, reduction_linear, attack_coeff, release_coeff):
+    """Optimized core logic for de-esser on a single channel."""
+    # Note: Numba cannot run SciPy lfilter. This function needs to be pure NumPy.
+    # This implementation is a placeholder and will not work as-is with Numba.
+    # We must remove the Numba JIT from this function.
+    
+    detect_signal = lfilter(b_detect, a_detect, audio_channel)
+    envelope = np.abs(detect_signal)
+    
+    window_size = 100
+    if envelope.size > window_size:
+        smooth_envelope = np.zeros_like(envelope)
+        for i in range(len(envelope)):
+            start = max(0, i - window_size // 2)
+            end = min(len(envelope), i + window_size // 2)
+            smooth_envelope[i] = np.mean(envelope[start:end])
+    else:
+        smooth_envelope = envelope
+
+    gain = np.where(smooth_envelope > threshold_linear, reduction_linear, 1.0)
+    
+    gain_smooth = np.ones_like(gain)
+    for i in range(1, len(gain)):
+         if gain[i] < gain_smooth[i-1]:
+              gain_smooth[i] = attack_coeff * gain_smooth[i-1] + (1.0-attack_coeff) * gain[i]
+         else:
+              gain_smooth[i] = release_coeff * gain_smooth[i-1] + (1.0-release_coeff) * gain[i]
+    
+    high_freq_signal = lfilter(b_process, a_process, audio_channel)
+    low_freq_signal = audio_channel - high_freq_signal
+    output = low_freq_signal + high_freq_signal * gain_smooth
+    return output
+
+# --- REMOVED NUMBA FROM _deesser_channel because it uses lfilter ---
+# A pure-python implementation (slow)
+def _deesser_channel_py(audio_channel, b_detect, a_detect, b_process, a_process, threshold_linear, reduction_linear, attack_coeff, release_coeff):
+    """Pure-python core logic for de-esser on a single channel."""
+    detect_signal = lfilter(b_detect, a_detect, audio_channel)
+    envelope = np.abs(detect_signal)
+    
+    window_size = 100
+    if envelope.size > window_size:
+        smooth_envelope = np.convolve(envelope, np.ones(window_size)/window_size, mode='same')
+    else:
+        smooth_envelope = envelope
+
+    gain = np.where(smooth_envelope > threshold_linear, reduction_linear, 1.0)
+    
+    gain_smooth = np.ones_like(gain)
+    for i in range(1, len(gain)):
+         if gain[i] < gain_smooth[i-1]:
+              gain_smooth[i] = attack_coeff * gain_smooth[i-1] + (1.0-attack_coeff) * gain[i]
+         else:
+              gain_smooth[i] = release_coeff * gain_smooth[i-1] + (1.0-release_coeff) * gain[i]
+    
+    high_freq_signal = lfilter(b_process, a_process, audio_channel)
+    low_freq_signal = audio_channel - high_freq_signal
+    output = low_freq_signal + high_freq_signal * gain_smooth
     return output
 
 
@@ -367,20 +404,36 @@ def apply_deesser(audio_data, sample_rate, frequency=6000, threshold_db=-15, rat
         frequency = np.clip(frequency, 2000, 12000)
         threshold_db = np.clip(threshold_db, -40, 0)
         ratio = np.clip(ratio, 1, 10)
+        reduction_db = np.clip(reduction_db, 0, 24)
+        
         threshold_linear = 10 ** (threshold_db / 20)
+        reduction_linear = 10 ** (-reduction_db / 20) # This is reduction gain, not ratio-based
+        
+        attack_ms = 1 
+        release_ms = 50
         attack_coeff = np.exp(-1.0 / (sample_rate * attack_ms / 1000))
         release_coeff = np.exp(-1.0 / (sample_rate * release_ms / 1000))
+        
         nyquist = sample_rate / 2
-        normalized_freq = frequency / nyquist
-        sos = butter(4, normalized_freq, btype='high', output='sos')
+        
+        # Detection filter
+        lower_sibilance_freq = (frequency * 0.7) / nyquist
+        upper_sibilance_freq = (frequency * 1.3) / nyquist
+        b_detect, a_detect = signal.butter(4, [np.clip(lower_sibilance_freq, 0.01, 0.99), np.clip(upper_sibilance_freq, 0.01, 0.99)], btype='bandpass')
+        
+        # Processing filter (what to cut)
+        process_freq = (frequency * 0.8) / nyquist
+        b_process, a_process = signal.butter(4, process_freq, btype='highpass')
+        
         if audio_data.ndim == 1:
-            hf_signal = sosfilt(sos, audio_data)
-            return _deesser_channel(audio_data, hf_signal, threshold_linear, ratio, attack_coeff, release_coeff).astype(np.float32)
+            return _deesser_channel_py(audio_data, b_detect, a_detect, b_process, a_process, threshold_linear, reduction_linear, attack_coeff, release_coeff).astype(np.float32)
         else:
             output = np.zeros_like(audio_data)
             for ch in range(audio_data.shape[1]):
-                hf_signal = sosfilt(sos, audio_data[:, ch])
-                output[:, ch] = _deesser_channel(audio_data[:, ch], hf_signal, threshold_linear, ratio, attack_coeff, release_coeff)
+                output[:, ch] = _deesser_channel_py(
+                    audio_data[:, ch], b_detect, a_detect, b_process, a_process,
+                    threshold_linear, reduction_linear, attack_coeff, release_coeff
+                )
             return output.astype(np.float32)
     except Exception as e:
         logging.error(f"De-esser error: {e}")
@@ -394,16 +447,20 @@ def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
             return audio_data
         target_lufs = np.clip(target_lufs, -30, -5)
         
-        # Use librosa for a more accurate RMS (closer to perceptual loudness)
-        # Note: This is still a very rough approximation of LUFS.
-        rms = librosa.feature.rms(y=audio_data, frame_length=2048, hop_length=512)[0]
+        if audio_data.ndim > 1:
+            # Use average of channels for RMS calculation
+            audio_for_rms = np.mean(audio_data, axis=1)
+        else:
+            audio_for_rms = audio_data
+
+        rms = librosa.feature.rms(y=audio_for_rms, frame_length=2048, hop_length=512)[0]
         avg_rms = np.mean(rms)
         
         if avg_rms < 1e-10:
             logging.warning("Audio is silent, skipping normalization.")
             return audio_data
 
-        current_lufs_approx = 20 * np.log10(avg_rms) + 10.0 # Heuristic offset
+        current_lufs_approx = 20 * np.log10(avg_rms) + 10.0
         gain_db = target_lufs - current_lufs_approx
         gain_db = np.clip(gain_db, -24, 24)
         gain_linear = 10 ** (gain_db / 20)
@@ -417,44 +474,6 @@ def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
         logging.error(f"Loudness normalization error: {e}")
         return audio_data
 
-def apply_stereo_widener(audio_data, width_percent=150):
-    """Stereo widening using mid-side processing."""
-    try:
-        if audio_data.ndim < 2 or audio_data.shape[1] < 2:
-            return audio_data
-        width_percent = np.clip(width_percent, 0, 200)
-        width = width_percent / 100.0
-        mid = (audio_data[:, 0] + audio_data[:, 1]) / 2
-        side = (audio_data[:, 0] - audio_data[:, 1]) / 2
-        side = side * width
-        output = np.zeros_like(audio_data)
-        output[:, 0] = mid + side
-        output[:, 1] = mid - side
-        max_val = np.max(np.abs(output))
-        if max_val > 1.0:
-            output = output / max_val
-        logging.info(f"Applied stereo widener: {width_percent}% width")
-        return output.astype(np.float32)
-    except Exception as e:
-        logging.error(f"Widener error: {e}")
-        return audio_data
-
-def apply_saturation(audio_data, drive_db=6, mix=0.5):
-    """Harmonic saturation using tanh."""
-    try:
-        if audio_data.size == 0: 
-            return audio_data
-        drive_db = np.clip(drive_db, 0, 24)
-        mix = np.clip(mix, 0, 1)
-        drive = 10 ** (drive_db / 20)
-        saturated = np.tanh(audio_data * drive)
-        saturated /= max(np.tanh(drive * 0.8), 1e-6) # Normalize
-        output = audio_data * (1 - mix) + saturated * mix
-        logging.info(f"Applied saturation: drive={drive_db}dB, mix={mix*100:.0f}%\n")
-        return output.astype(np.float32)
-    except Exception as e:
-        logging.error(f"Saturation error: {e}")
-        return audio_data
 
 # ==================== STEM SEPARATION (ASYNC + DIRECT UPLOAD) ====================
 
@@ -506,7 +525,7 @@ def process_stems_async(wav_path, output_dir, callback_url, project_id, base44_a
                 else:
                     logging.warning(f"⚠️ Failed to upload {stem_name}.mp3")
             else:
-                logging.warning(f"⚠️ Missing {stem_name}.mp3")
+                logging.warning(f"⚠️ Missing {stem_name}.mp3 at {stem_file_path}")
         
         if not stems_urls:
             raise ValueError("No stems were successfully uploaded to Base44")
@@ -591,12 +610,6 @@ def separate_stems():
         base44_api_key = request.form.get('base44_api_key')
         base44_app_id = request.form.get('base44_app_id')
         base44_service_key = request.form.get('base44_service_key')
-        
-        logging.info(f"📦 project_id: {project_id}")
-        logging.info(f"📦 callback_url: {callback_url}")
-        logging.info(f"🔑 api_key present: {bool(base44_api_key)}")
-        logging.info(f"🆔 app_id present: {bool(base44_app_id)}")
-        logging.info(f"🔑 service_key present: {bool(base44_service_key)}")
         
         if file.filename == '':
             return jsonify({"error": "Empty filename"}), 400
