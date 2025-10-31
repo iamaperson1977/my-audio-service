@@ -4,25 +4,26 @@ import numpy as np
 import soundfile as sf
 # Use specific imports from scipy.signal for clarity
 from scipy.signal import butter, sosfilt, sosfiltfilt, tf2sos, iirpeak, iirnotch
-from scipy import signal # Keep for potential other uses
+from scipy import signal
 import logging
 from pydub import AudioSegment
-import librosa # Keep, may be needed by demucs dependencies
+import librosa
 import tempfile
 import shutil
-import numba # <-- IMPORT IS HERE
+import numba 
 import subprocess
 import sys
-import json # For parsing instructions
+import json 
 import atexit
-import base64 # <-- NEW IMPORT, GOOD
-import threading # <-- NEW IMPORT for Async
-import requests  # <-- NEW IMPORT for Callback
+import base64 
+import threading 
+import requests  
+# --- CRITICAL FIX: ADDED MISSING IMPORT ---
+from scipy.signal import lfilter 
 
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
-# Enhanced logging format for better debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Setup directories
@@ -32,7 +33,7 @@ logging.info(f"Using UPLOAD_FOLDER: {UPLOAD_FOLDER}")
 logging.info(f"Using OUTPUT_FOLDER: {OUTPUT_FOLDER}")
 
 # ==================== FILE FORMAT HANDLING ====================
-# (All file handling functions are correct, no changes needed)
+
 def convert_to_wav(input_path, output_path):
     """Convert any audio format to WAV using pydub/ffmpeg."""
     try:
@@ -69,6 +70,35 @@ def write_wav(filepath, audio_data, sample_rate):
     except Exception as e:
         logging.error(f"Error writing WAV: {e}")
         return False
+
+# ==================== BASE44 FILE UPLOAD HELPER (FROM BASE44) ====================
+
+def upload_file_to_base44(file_path, filename, service_key, app_id):
+    """Upload file to Base44 storage using service role."""
+    try:
+        with open(file_path, 'rb') as f:
+            files = {'file': (filename, f, 'audio/mpeg')}
+            headers = {
+                'Authorization': f'Bearer {service_key}',
+                'Base44-App-Id': app_id
+            }
+            response = requests.post(
+                f'https://app.base44.com/api/integrations/Core/UploadFile',
+                files=files,
+                headers=headers,
+                timeout=120
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                logging.info(f"✅ Base44 Upload Successful: {result.get('file_url')}")
+                return result.get('file_url')
+            else:
+                logging.error(f"Upload failed: {response.status_code} - {response.text}")
+                return None
+    except Exception as e:
+        logging.error(f"Upload error: {e}")
+        return None
 
 # ==================== DSP FUNCTIONS (FINAL WORKING SET) ====================
 
@@ -148,7 +178,6 @@ def apply_parametric_eq(audio_data, sample_rate, frequency, gain_db, q_factor=1.
             a0 = 1 + alpha / A; a1 = -2 * np.cos(w0); a2 = 1 - alpha / A
         
         elif filter_type == 'lowshelf':
-            beta = np.sqrt(A**2 + A**2) / q_factor # approx
             b0 = A * ((A + 1) - (A - 1) * np.cos(w0) + 2 * np.sqrt(A) * alpha)
             b1 = 2 * A * ((A - 1) - (A + 1) * np.cos(w0))
             b2 = A * ((A + 1) - (A - 1) * np.cos(w0) - 2 * np.sqrt(A) * alpha)
@@ -308,9 +337,7 @@ def apply_limiter(audio_data, sample_rate, threshold_db=-1.0, release_ms=50):
         return audio_data
 
 
-# --- 💥 CRITICAL FIX: REMOVED @numba.jit FROM THIS FUNCTION 💥 ---
-# Numba cannot compile scipy's lfilter/convolve, which caused the server to crash on boot.
-# This function will be SLOW, but it will WORK.
+# This is the non-numba version that is SLOW but WORKS
 def _deesser_channel_py(audio_channel, b_detect, a_detect, b_process, a_process, threshold_linear, reduction_linear, attack_coeff, release_coeff):
     """Pure-python core logic for de-esser on a single channel."""
     detect_signal = lfilter(b_detect, a_detect, audio_channel)
@@ -347,7 +374,7 @@ def apply_deesser(audio_data, sample_rate, frequency=6000, threshold_db=-15, rat
         reduction_db = np.clip(reduction_db, 0, 24)
         
         threshold_linear = 10 ** (threshold_db / 20)
-        reduction_linear = 10 ** (-reduction_db / 20) # This is reduction gain, not ratio-based
+        reduction_linear = 1.0 / ratio # Use ratio for reduction
         
         attack_ms = 1 
         release_ms = 50
@@ -398,7 +425,7 @@ def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
             logging.warning("Audio is silent, skipping normalization.")
             return audio_data
 
-        current_lufs_approx = 20 * np.log10(avg_rms) + 10.0 # Heuristic offset
+        current_lufs_approx = 20 * np.log10(avg_rms) + 10.0
         gain_db = target_lufs - current_lufs_approx
         gain_db = np.clip(gain_db, -24, 24)
         gain_linear = 10 ** (gain_db / 20)
@@ -406,11 +433,12 @@ def normalize_loudness(audio_data, sample_rate, target_lufs=-14.0):
         normalized = audio_data * gain_linear
         normalized = apply_limiter(normalized, sample_rate, threshold_db=-1.0)
         
-        logging.info(f"Normalized: {current_lufs_approx:.1f} LUFS -> {target_lufs:.1f} LUFS (gain: {gain_db:.1f} dB)")
+        logging.info(f"Normalized: {current_lufs_approx:.1f} LUFS (approx) -> {target_lufs:.1f} LUFS (gain: {gain_db:.1f} dB)")
         return normalized.astype(np.float32)
     except Exception as e:
         logging.error(f"Loudness normalization error: {e}")
         return audio_data
+
 
 def apply_stereo_widener(audio_data, width_percent=150):
     """Stereo widening."""
@@ -447,7 +475,6 @@ def apply_saturation(audio_data, drive_db=6, mix=0.5):
     except Exception as e:
         logging.error(f"Saturation error: {e}")
         return audio_data
-
 
 # ==================== STEM SEPARATION (ASYNC + DIRECT UPLOAD) ====================
 
