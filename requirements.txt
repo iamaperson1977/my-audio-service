@@ -4,3 +4,4 @@ demucs==4.0.1
 torch==2.1.2
 torchaudio==2.1.2
 requests==2.31.0
+numpy<2.0
