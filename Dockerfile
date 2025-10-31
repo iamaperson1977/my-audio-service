@@ -21,4 +21,4 @@ COPY audioProcessingService.py .
 EXPOSE $PORT
 
 # Run with gunicorn using Railway's PORT
-CMD gunicorn -w 4 -b 0.0.0.0:$PORT --timeout 300 audioProcessingService:app
+CMD gunicorn -w 4 -b 0.0.0.0:$PORT --timeout 3000 audioProcessingService:app
