@@ -139,7 +139,10 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
         logger.info('=' * 80)
         logger.info(f"📞 [{job_id}] CALLING CALLBACK URL WITH BASE64 STEMS")
         logger.info('=' * 80)
-        logger.info(f"🔗 [{job_id}] URL: {callback_url}")
+        logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
+        logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
+        logger.info(f"🆔 [{job_id}] App ID: {base44_app_id}")
+        logger.info(f"🔑 [{job_id}] Service key length: {len(base44_service_key) if base44_service_key else 0}")
         
         callback_payload = {
             'project_id': project_id,
@@ -148,19 +151,27 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
         }
         logger.info(f"📦 [{job_id}] Sending {len(stems_base64)} stems to callback")
         
+        headers = {
+            'Content-Type': 'application/json',
+            'Base44-App-Id': base44_app_id
+        }
+        
+        if base44_service_key:
+            headers['Authorization'] = f'Bearer {base44_service_key}'
+            logger.info(f"🔑 [{job_id}] Added Authorization header")
+        
+        logger.info(f"📤 [{job_id}] Callback headers: {list(headers.keys())}")
+        
         callback_response = requests.post(
             callback_url,
-            headers={
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {base44_service_key}',
-                'Base44-App-Id': base44_app_id
-            },
+            headers=headers,
             json=callback_payload,
             timeout=120  # 2 minute timeout for uploading stems
         )
         
         logger.info(f"📥 [{job_id}] Callback response status: {callback_response.status_code}")
-        logger.debug(f"📥 [{job_id}] Callback response: {callback_response.text}")
+        logger.info(f"📥 [{job_id}] Callback response headers: {dict(callback_response.headers)}")
+        logger.debug(f"📥 [{job_id}] Callback response body: {callback_response.text[:500]}")
         
         if callback_response.status_code != 200:
             logger.error(f"❌ [{job_id}] Callback failed!")
@@ -183,15 +194,18 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
         
         # Try to notify callback of failure
         try:
-            if callback_url and project_id and base44_service_key and base44_app_id:
+            if callback_url and project_id and base44_app_id:
                 logger.info(f"📞 [{job_id}] Notifying callback of failure...")
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Base44-App-Id': base44_app_id
+                }
+                if base44_service_key:
+                    headers['Authorization'] = f'Bearer {base44_service_key}'
+                
                 requests.post(
                     callback_url,
-                    headers={
-                        'Content-Type': 'application/json',
-                        'Authorization': f'Bearer {base44_service_key}',
-                        'Base44-App-Id': base44_app_id
-                    },
+                    headers=headers,
                     json={
                         'project_id': project_id,
                         'success': False,
