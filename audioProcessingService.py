@@ -7,7 +7,7 @@ import subprocess
 import atexit
 import requests
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import base64
 from flask import Flask, request, jsonify
 import torch
 
@@ -47,42 +47,8 @@ def cleanup_temp_dirs():
 
 atexit.register(cleanup_temp_dirs)
 
-def upload_stem_to_base44(stem_name, stem_path, base44_service_key, job_id):
-    """
-    OPTIMIZATION 3: Parallel upload function for concurrent stem uploads
-    """
-    try:
-        logger.info(f"📤 [{job_id}] Uploading {stem_name}...")
-        
-        with open(stem_path, 'rb') as f:
-            upload_response = requests.post(
-                'https://app.base44.com/api/integrations/Core.UploadFile',
-                headers={
-                    'Authorization': f'Bearer {base44_service_key}'
-                },
-                files={'file': (f'{stem_name}.wav', f, 'audio/wav')},
-                timeout=60  # 60 second timeout per upload
-            )
-        
-        logger.debug(f"📥 [{job_id}] Upload response status for {stem_name}: {upload_response.status_code}")
-        
-        if upload_response.status_code != 200:
-            logger.error(f"❌ [{job_id}] Upload failed for {stem_name}")
-            logger.error(f"   Status: {upload_response.status_code}")
-            logger.error(f"   Response: {upload_response.text}")
-            raise Exception(f"Failed to upload {stem_name}: {upload_response.text}")
-        
-        file_url = upload_response.json().get('file_url')
-        logger.info(f"✅ [{job_id}] {stem_name} uploaded: {file_url[:80]}...")
-        
-        return stem_name, file_url
-    
-    except Exception as e:
-        logger.error(f"❌ [{job_id}] Error uploading {stem_name}: {str(e)}")
-        raise
-
 def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_service_key, base44_app_id):
-    """Background worker function with OPTIMIZATIONS 3 & 4"""
+    """Background worker function - returns stems as base64 to callback"""
     try:
         logger.info(f"🎸 [{job_id}] Background worker started")
         
@@ -91,15 +57,12 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
         logger.info(f"🎸 [{job_id}] STARTING DEMUCS STEM SEPARATION (OPTIMIZED)")
         logger.info('=' * 80)
         
-        # OPTIMIZATION 2: Use mdx_extra model (faster than htdemucs)
-        # Add segment processing for better memory efficiency
-        # Keep 4-stem separation for full instrument breakdown
         demucs_cmd = [
             'python3', '-m', 'demucs',
             '-o', OUTPUT_FOLDER,
-            '-n', 'mdx_extra',  # CHANGED: Faster model
-            '--segment', '10',   # ADDED: Process in 10-second segments (faster, less memory)
-            '--jobs', '2',       # ADDED: Use 2 parallel jobs if CPU allows
+            '-n', 'mdx_extra',
+            '--segment', '10',
+            '--jobs', '2',
             wav_path
         ]
         logger.info(f"🔧 [{job_id}] Demucs command: {' '.join(demucs_cmd)}")
@@ -141,56 +104,28 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
             'other': os.path.join(output_dir, 'other.wav')
         }
         
-        # Check which stems exist
+        # Check which stems exist and encode to base64
         logger.info('=' * 80)
-        logger.info(f"🎼 [{job_id}] VERIFYING STEMS")
-        logger.info('=' * 80)
-        for stem_name, stem_path in stem_files.items():
-            exists = os.path.exists(stem_path)
-            logger.info(f"{'✅' if exists else '❌'} [{job_id}] {stem_name}: {exists}")
-            if exists:
-                size = os.path.getsize(stem_path)
-                logger.info(f"   Size: {size} bytes ({size / 1024 / 1024:.2f} MB)")
-        
-        # OPTIMIZATION 3: PARALLEL STEM UPLOADS
-        logger.info('=' * 80)
-        logger.info(f"☁️ [{job_id}] UPLOADING STEMS TO BASE44 (PARALLEL)")
+        logger.info(f"🎼 [{job_id}] ENCODING STEMS TO BASE64")
         logger.info('=' * 80)
         
-        stems_urls = {}
-        upload_tasks = []
+        stems_base64 = {}
         
-        # Create list of stems to upload (only existing files)
         for stem_name, stem_path in stem_files.items():
             if os.path.exists(stem_path):
-                upload_tasks.append((stem_name, stem_path))
+                size = os.path.getsize(stem_path)
+                logger.info(f"✅ [{job_id}] {stem_name}: {size} bytes ({size / 1024 / 1024:.2f} MB)")
+                
+                # Read file and encode to base64
+                with open(stem_path, 'rb') as f:
+                    file_data = f.read()
+                    encoded = base64.b64encode(file_data).decode('utf-8')
+                    stems_base64[stem_name] = encoded
+                    logger.info(f"✅ [{job_id}] {stem_name} encoded to base64 ({len(encoded)} chars)")
             else:
                 logger.warning(f"⚠️ [{job_id}] Missing stem: {stem_name}, skipping")
         
-        # Upload stems in parallel using ThreadPoolExecutor
-        logger.info(f"🚀 [{job_id}] Starting {len(upload_tasks)} parallel uploads...")
-        
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            # Submit all upload tasks
-            future_to_stem = {
-                executor.submit(upload_stem_to_base44, stem_name, stem_path, base44_service_key, job_id): stem_name
-                for stem_name, stem_path in upload_tasks
-            }
-            
-            # Collect results as they complete
-            for future in as_completed(future_to_stem):
-                stem_name = future_to_stem[future]
-                try:
-                    returned_stem_name, file_url = future.result()
-                    stems_urls[returned_stem_name] = file_url
-                except Exception as e:
-                    logger.error(f"❌ [{job_id}] Upload failed for {stem_name}: {str(e)}")
-                    raise
-        
-        logger.info(f"✅ [{job_id}] All stems uploaded successfully!")
-        logger.info(f"📊 [{job_id}] Total stems: {len(stems_urls)}")
-        
-        # Cleanup
+        # Cleanup temp files
         logger.info(f"🧹 [{job_id}] Cleaning up temp files...")
         try:
             os.remove(input_path)
@@ -200,18 +135,18 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
         except Exception as e:
             logger.warning(f"⚠️ [{job_id}] Cleanup warning: {e}")
         
-        # Call callback URL
+        # Call callback URL with base64-encoded stems
         logger.info('=' * 80)
-        logger.info(f"📞 [{job_id}] CALLING CALLBACK URL")
+        logger.info(f"📞 [{job_id}] CALLING CALLBACK URL WITH BASE64 STEMS")
         logger.info('=' * 80)
         logger.info(f"🔗 [{job_id}] URL: {callback_url}")
         
         callback_payload = {
             'project_id': project_id,
-            'stems_urls': stems_urls,
+            'stems_base64': stems_base64,
             'success': True
         }
-        logger.debug(f"📦 [{job_id}] Callback payload: {callback_payload}")
+        logger.info(f"📦 [{job_id}] Sending {len(stems_base64)} stems to callback")
         
         callback_response = requests.post(
             callback_url,
@@ -221,7 +156,7 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
                 'Base44-App-Id': base44_app_id
             },
             json=callback_payload,
-            timeout=30
+            timeout=120  # 2 minute timeout for uploading stems
         )
         
         logger.info(f"📥 [{job_id}] Callback response status: {callback_response.status_code}")
@@ -276,7 +211,7 @@ def health_check():
         'status': 'healthy',
         'service': 'audio-processing-stem-separation-optimized',
         'model': 'mdx_extra',
-        'optimizations': ['parallel_uploads', 'ffmpeg_optimized', 'segment_processing'],
+        'optimizations': ['base64_transfer', 'ffmpeg_optimized', 'segment_processing'],
         'upload_folder': UPLOAD_FOLDER,
         'output_folder': OUTPUT_FOLDER,
         'cuda_available': torch.cuda.is_available()
@@ -285,7 +220,7 @@ def health_check():
 @app.route('/separate_stems', methods=['POST'])
 def separate_stems():
     """
-    OPTIMIZED: ASYNC STEM SEPARATION WITH FASTER MODEL + PARALLEL UPLOADS
+    OPTIMIZED: ASYNC STEM SEPARATION - Returns stems as base64 to callback
     """
     job_id = str(uuid.uuid4())[:8]
     
@@ -333,23 +268,19 @@ def separate_stems():
         logger.info(f"✅ [{job_id}] File saved successfully")
         logger.info(f"📊 [{job_id}] File size: {file_size} bytes ({file_size / 1024 / 1024:.2f} MB)")
         
-        # OPTIMIZATION 4: FFmpeg with optimized settings
+        # Convert to WAV with optimized FFmpeg
         wav_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input.wav")
         if not input_path.endswith('.wav'):
             logger.info(f"🔄 [{job_id}] Converting to WAV with optimized FFmpeg...")
             
-            # OPTIMIZATION 4: Optimized FFmpeg command
-            # -threads 0: Use all available CPU threads
-            # -loglevel error: Reduce verbose output
-            # -preset ultrafast: Fast encoding (for conversion, not compression)
             ffmpeg_cmd = [
                 'ffmpeg',
-                '-threads', '0',        # Use all CPU threads
-                '-i', input_path,       # Input file
-                '-ar', '44100',         # Sample rate 44.1kHz
-                '-ac', '2',             # Stereo
-                '-loglevel', 'error',   # Less verbose
-                '-y',                   # Overwrite output
+                '-threads', '0',
+                '-i', input_path,
+                '-ar', '44100',
+                '-ac', '2',
+                '-loglevel', 'error',
+                '-y',
                 wav_path
             ]
             
@@ -389,7 +320,7 @@ def separate_stems():
         return jsonify({
             'success': True,
             'project_id': project_id,
-            'message': 'Stem separation started in background (fully optimized)'
+            'message': 'Stem separation started in background'
         })
     
     except Exception as e:
@@ -408,6 +339,5 @@ if __name__ == '__main__':
     logger.info(f"🚀 Starting Flask server on port {port}")
     logger.info('=' * 80)
     app.run(host='0.0.0.0', port=port, debug=False)
-
 
 
