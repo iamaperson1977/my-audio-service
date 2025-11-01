@@ -1,7 +1,11 @@
 # audioProcessingService.py
+# ──────────────────────────────────────────────────────────────────────────────
+# IMPORTS (stacked at top)
+# ──────────────────────────────────────────────────────────────────────────────
 import os
 import sys
 import uuid
+import time
 import base64
 import atexit
 import shutil
@@ -9,238 +13,242 @@ import tempfile
 import logging
 import threading
 import subprocess
-from typing import Dict
+from typing import Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 from flask import Flask, request, jsonify
 
-# ────────────────────────────────────────────────────────────────────────────
-# Logging
-# ────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
-)
-log = logging.getLogger("audio-service")
-
-# ────────────────────────────────────────────────────────────────────────────
-# Env
-# ────────────────────────────────────────────────────────────────────────────
-PYTHON_SERVICE_KEY = os.environ.get("PYTHON_SERVICE_KEY")
-BASE44_APP_ID = os.environ.get("BASE44_APP_ID", "")
-FFMPEG_BIN = os.environ.get("FFMPEG_PATH", "ffmpeg")
-
+# ──────────────────────────────────────────────────────────────────────────────
+# CONSTANTS / ENV (stacked at top)
+# ──────────────────────────────────────────────────────────────────────────────
+PYTHON_SERVICE_KEY = os.getenv("PYTHON_SERVICE_KEY")  # REQUIRED
 if not PYTHON_SERVICE_KEY:
     raise RuntimeError("PYTHON_SERVICE_KEY env var is required")
-if not BASE44_APP_ID:
-    log.warning("BASE44_APP_ID not set (callbacks will be unauthorized on Base44)")
 
-# ────────────────────────────────────────────────────────────────────────────
-# Flask
-# ────────────────────────────────────────────────────────────────────────────
+FFMPEG_BIN = os.getenv("FFMPEG_PATH", "ffmpeg")       # optional, default 'ffmpeg'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOGGING (stacked at top)
+# ──────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
+)
+logger = logging.getLogger("audio-service")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# APP / PATHS (top)
+# ──────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB
 
-UPLOAD_DIR = tempfile.mkdtemp(prefix="audio_upload_")
-OUTPUT_DIR = tempfile.mkdtemp(prefix="audio_output_")
+UPLOAD_DIR = tempfile.mkdtemp(prefix="upload_")
+OUTPUT_DIR = tempfile.mkdtemp(prefix="output_")
 
+# Torch info for /health (optional)
+try:
+    import torch
+    TORCH_VER = torch.__version__
+    CUDA_OK = bool(torch.cuda.is_available())
+except Exception:
+    TORCH_VER = "unavailable"
+    CUDA_OK = False
+
+logger.info("🚀 Python audio service starting")
+logger.info(f"📁 Upload: {UPLOAD_DIR}")
+logger.info(f"📁 Output: {OUTPUT_DIR}")
+logger.info(f"🐍 Python: {sys.version.split()[0]}")
+logger.info(f"🔥 Torch: {TORCH_VER} | CUDA: {CUDA_OK}")
+logger.info(f"🎬 FFmpeg: {FFMPEG_BIN}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLEANUP
+# ──────────────────────────────────────────────────────────────────────────────
 def _cleanup():
     for p in (UPLOAD_DIR, OUTPUT_DIR):
         try:
-            if os.path.exists(p):
-                shutil.rmtree(p, ignore_errors=True)
+            shutil.rmtree(p, ignore_errors=True)
         except Exception as e:
-            log.warning("Cleanup warning for %s: %s", p, e)
+            logger.warning("Cleanup failed for %s: %s", p, e)
 
 atexit.register(_cleanup)
 
-# ────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ────────────────────────────────────────────────────────────────────────────
-def run(cmd: list[str]) -> None:
-    """Run a shell command, raising on non-zero exit with useful context."""
-    log.info("Exec: %s", " ".join(cmd))
-    res = subprocess.run(cmd, capture_output=True, text=True)
+# ──────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ──────────────────────────────────────────────────────────────────────────────
+def _run(cmd: list[str], timeout: int) -> None:
+    """Run a command and raise with useful context on failure."""
+    logger.info("⚙️  Exec: %s", " ".join(cmd))
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if res.stdout:
-        log.info("stdout: %s", res.stdout.strip()[:2000])
+        logger.debug("stdout: %s", res.stdout[:2000])
     if res.stderr:
-        log.info("stderr: %s", res.stderr.strip()[:2000])
+        logger.debug("stderr: %s", res.stderr[:2000])
     if res.returncode != 0:
         raise RuntimeError(f"Command failed ({res.returncode}): {res.stderr}")
 
-def send_callback(callback_url: str, payload: dict) -> requests.Response:
+def _send_callback(
+    url: str,
+    base44_app_id: str,
+    payload: Dict,
+    timeout_s: int = 90,
+    max_attempts: int = 4,
+    backoff_base: float = 0.75
+) -> requests.Response:
+    """POST JSON with required headers; retry on transient failures."""
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-        "Base44-App-Id": BASE44_APP_ID,
+        "Base44-App-Id": base44_app_id,   # REQUIRED by Base44
     }
-    log.info("POST -> %s  keys=%s", callback_url, list(payload.keys()))
-    resp = requests.post(callback_url, json=payload, headers=headers, timeout=120)
-    log.info("Callback status: %s", resp.status_code)
-    if resp.status_code != 200:
-        log.error("Callback body: %s", resp.text[:500])
-    return resp
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(url, json=payload, headers=headers, timeout=timeout_s)
+            if resp.status_code < 500:
+                return resp
+            logger.warning("🌐 Callback %s/%s → %s (retrying)", attempt, max_attempts, resp.status_code)
+        except requests.RequestException as exc:
+            last_exc = exc
+            logger.warning("🌐 Callback attempt %s/%s failed: %s", attempt, max_attempts, exc)
+        time.sleep(backoff_base * (2 ** (attempt - 1)))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Callback failed without exception")
 
-def encode_b64(path: str) -> str:
-    with open(path, "rb") as f:
-        return base64.b64encode(f.read()).decode("utf-8")
-
-# ────────────────────────────────────────────────────────────────────────────
-# Worker
-# ────────────────────────────────────────────────────────────────────────────
-def worker(job_id: str, src_path: str, wav_path: str, callback_url: str, project_id: str):
+# ──────────────────────────────────────────────────────────────────────────────
+# WORKER: Demucs → stream partials → final "done"
+# ──────────────────────────────────────────────────────────────────────────────
+def _worker(job_id: str, src: str, wav: str, cb_url: str, project_id: str, app_id: str):
     try:
-        log.info("===== JOB %s START =====", job_id)
-        # Demucs → mdx_extra (balanced speed/quality) into OUTPUT_DIR
-        demucs_cmd = [
+        logger.info("🎸 [%s] Starting Demucs", job_id)
+        demucs = [
             sys.executable, "-m", "demucs",
             "-o", OUTPUT_DIR,
             "-n", "mdx_extra",
             "--segment", "10",
             "--jobs", "2",
-            wav_path,
+            wav
         ]
-        run(demucs_cmd)
+        _run(demucs, timeout=1800)
 
-        base = os.path.splitext(os.path.basename(wav_path))[0]
-        demucs_out = os.path.join(OUTPUT_DIR, "mdx_extra", base)
-        if not os.path.isdir(demucs_out):
-            raise RuntimeError(f"Demucs output missing: {demucs_out}")
+        base_name = os.path.splitext(os.path.basename(wav))[0]
+        out_dir = os.path.join(OUTPUT_DIR, "mdx_extra", base_name)
+        if not os.path.isdir(out_dir):
+            raise RuntimeError(f"Demucs output dir not found: {out_dir}")
+        logger.info("📂 [%s] Output: %s | %s", job_id, out_dir, os.listdir(out_dir))
 
-        # Expected stems
-        stems: Dict[str, str] = {
-            "vocals": os.path.join(demucs_out, "vocals.wav"),
-            "drums":  os.path.join(demucs_out, "drums.wav"),
-            "bass":   os.path.join(demucs_out, "bass.wav"),
-            "other":  os.path.join(demucs_out, "other.wav"),
-        }
-
-        # Send each stem as a separate (small) callback
-        for name, path in stems.items():
+        stems = ["vocals", "drums", "bass", "other"]
+        sent = 0
+        for part in stems:
+            path = os.path.join(out_dir, f"{part}.wav")
             if not os.path.exists(path):
-                log.warning("Stem missing: %s", name)
+                logger.warning("⚠️  [%s] Missing stem: %s", job_id, part)
                 continue
-            b64 = encode_b64(path)
-            resp = send_callback(callback_url, {
+            with open(path, "rb") as f:
+                data_b64 = base64.b64encode(f.read()).decode("utf-8")
+            payload = {
                 "project_id": project_id,
-                "success": True,
                 "mode": "partial",
-                "part": name,
-                "data_base64": b64,
-            })
-            if resp.status_code != 200:
-                raise RuntimeError(f"Partial callback failed for {name}: {resp.status_code}")
+                "part": part,
+                "data_base64": data_b64
+            }
+            r = _send_callback(cb_url, app_id, payload)
+            logger.info("📤 [%s] Sent partial '%s' → %s", job_id, part, r.status_code)
+            if r.status_code != 200:
+                raise RuntimeError(f"Partial '{part}' failed: {r.status_code} {r.text[:200]}")
+            sent += 1
 
-        # Final “done” signal (lets Base44 mark completed)
-        done_resp = send_callback(callback_url, {
-            "project_id": project_id,
-            "success": True,
-            "mode": "done"
-        })
-        if done_resp.status_code != 200:
-            raise RuntimeError(f"Done callback failed: {done_resp.status_code}")
+        if sent == 0:
+            raise RuntimeError("No stems generated")
 
-        log.info("===== JOB %s OK =====", job_id)
+        # Finalize
+        done_payload = {"project_id": project_id, "mode": "done"}
+        r = _send_callback(cb_url, app_id, done_payload)
+        logger.info("🏁 [%s] Done → %s", job_id, r.status_code)
+        if r.status_code != 200:
+            raise RuntimeError(f"Finalize failed: {r.status_code} {r.text[:200]}")
 
     except Exception as e:
-        log.exception("JOB %s FAILED: %s", job_id, e)
-        # Best-effort error callback
+        logger.error("❌ [%s] Job failed: %s", job_id, e)
         try:
-            send_callback(callback_url, {
-                "project_id": project_id,
-                "success": False,
-                "error": str(e),
-            })
-        except Exception as e2:
-            log.error("Failed to send error callback: %s", e2)
+            err = {"project_id": project_id, "success": False, "error": str(e)}
+            _send_callback(cb_url, app_id, err, timeout_s=30)
+        except Exception as ce:
+            logger.error("Error callback failed: %s", ce)
     finally:
-        # local cleanup
-        for p in (src_path, wav_path):
+        # Best-effort cleanup
+        for p in (src, wav, os.path.join(OUTPUT_DIR, "mdx_extra", os.path.splitext(os.path.basename(wav))[0])):
             try:
-                if p and os.path.exists(p):
+                if os.path.isdir(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                elif os.path.isfile(p):
                     os.remove(p)
             except Exception:
                 pass
 
-# ────────────────────────────────────────────────────────────────────────────
-# Routes
-# ────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ──────────────────────────────────────────────────────────────────────────────
 @app.route("/separate_stems", methods=["POST"])
 def separate_stems():
     job_id = str(uuid.uuid4())[:8]
     try:
         f = request.files.get("file")
-        callback_url = request.form.get("callback_url")
+        cb_url = request.form.get("callback_url")
         project_id = request.form.get("project_id")
-        app_id_seen = request.form.get("base44_app_id")  # for logging only
+        app_id = request.form.get("base44_app_id")
 
-        if not f or not callback_url or not project_id:
-            return jsonify({"error": "Missing file, callback_url, or project_id"}), 400
+        if not all([f, cb_url, project_id, app_id]):
+            return jsonify({"error": "Missing file, callback_url, project_id, or base44_app_id"}), 400
 
-        log.info("JOB %s new request", job_id)
-        log.info("Base44 app id (form): %s", app_id_seen)
-        log.info("Upload dir: %s", UPLOAD_DIR)
-        log.info("Output dir: %s", OUTPUT_DIR)
-        log.info("FFmpeg: %s", FFMPEG_BIN)
+        u = urlparse(cb_url)
+        if u.scheme not in ("http", "https") or not u.netloc:
+            return jsonify({"error": "Invalid callback_url"}), 400
 
-        # Save original
-        src_path = os.path.join(UPLOAD_DIR, f"{job_id}_{f.filename}")
-        f.save(src_path)
+        src = os.path.join(UPLOAD_DIR, f"{job_id}_{f.filename}")
+        f.save(src)
 
-        # Convert to wav (44.1kHz, stereo)
-        wav_path = os.path.join(UPLOAD_DIR, f"{job_id}.wav")
-        ffmpeg_cmd = [
-            FFMPEG_BIN, "-y",
-            "-i", src_path,
-            "-ar", "44100",
-            "-ac", "2",
-            "-loglevel", "error",
-            wav_path,
-        ]
-        run(ffmpeg_cmd)
+        wav = os.path.join(UPLOAD_DIR, f"{job_id}.wav")
+        ff = [FFMPEG_BIN, "-threads", "0", "-i", src, "-ar", "44100", "-ac", "2", "-loglevel", "error", "-y", wav]
+        _run(ff, timeout=600)
 
-        # Background process
-        th = threading.Thread(
-            target=worker,
-            args=(job_id, src_path, wav_path, callback_url, project_id),
+        threading.Thread(
+            target=_worker,
+            args=(job_id, src, wav, cb_url, project_id, app_id),
             name=f"job-{job_id}",
-            daemon=True,
-        )
-        th.start()
+            daemon=True
+        ).start()
 
         return jsonify({"success": True, "job_id": job_id, "project_id": project_id}), 202
 
     except Exception as e:
-        log.exception("REQUEST FAILED: %s", e)
-        # best effort immediate error callback if we can
+        # Best-effort immediate error callback
         try:
-            if request.form.get("callback_url") and request.form.get("project_id"):
-                send_callback(request.form["callback_url"], {
-                    "project_id": request.form["project_id"],
-                    "success": False,
-                    "error": str(e),
-                })
+            if "cb_url" in locals() and "project_id" in locals() and "app_id" in locals():
+                _send_callback(cb_url, app_id, {"project_id": project_id, "success": False, "error": str(e)}, timeout_s=30)
         except Exception:
             pass
-        return jsonify({"error": str(e), "error_type": type(e).__name__}), 500
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/health", methods=["GET"])
 def health():
-    import torch  # lazy import; we only need the version
     return jsonify({
         "status": "healthy",
-        "service": "audio-processing-service",
         "python_version": sys.version.split()[0],
-        "torch_version": getattr(torch, "__version__", "unknown"),
-        "cuda_available": getattr(torch.cuda, "is_available", lambda: False)(),
+        "torch_version": TORCH_VER,
+        "cuda_available": CUDA_OK
     }), 200
 
-# ────────────────────────────────────────────────────────────────────────────
-# Local run
-# ────────────────────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# ENTRY
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8000"))
-    log.info("Starting on 0.0.0.0:%s", port)
+    port = int(os.getenv("PORT", 8000))
+    logger.info("🌐 Serving on :%s", port)
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
 
 
 
