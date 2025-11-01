@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg-info/
+
+# Temporary files
+*.log
+*.tmp
+*.temp
+stems_upload_*/
+stems_output_*/
+*.wav
+*.mp3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets - NEVER COMMIT!
+.env
+.env.local
+*.pem
+*.key
+config.local.py
