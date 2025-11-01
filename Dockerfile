@@ -1,25 +1,55 @@
-FROM python:3.9-slim
+FROM python:3.10-slim
 
-# System deps for audio I/O and Demucs
-RUN apt-get update && apt-get install -y \
+# Prevent Python from writing .pyc files and buffering stdout/stderr
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# Install system dependencies for audio processing
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     git \
+    curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-# Install Python deps first (better cache)
+# Copy requirements first for better Docker layer caching
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app code
-COPY . .
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Expose a concrete port at build time; Railway still injects $PORT at runtime
+# Copy application code
+COPY app.py .
+
+# Create temp directories with proper permissions
+RUN mkdir -p /app/temp_uploads /app/temp_outputs && \
+    chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Expose port (Railway will override with $PORT env var)
 EXPOSE 8000
 
-# Start with Gunicorn; shell expands $PORT, default to 8000 if missing
-CMD ["sh", "-c", "gunicorn -k gthread -w 2 -t 600 -b 0.0.0.0:${PORT:-8000} audioProcessingService:app"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:${PORT:-8000}/health || exit 1
+
+# Run with gunicorn for production
+CMD gunicorn --bind 0.0.0.0:${PORT:-8000} \
+    --workers 2 \
+    --threads 4 \
+    --timeout 600 \
+    --keep-alive 5 \
+    --log-level info \
+    --access-logfile - \
+    --error-logfile - \
+    app:app
 
 
