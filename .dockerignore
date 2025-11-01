@@ -1,0 +1,56 @@
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+env/
+venv/
+ENV/
+.venv/
+
+# Python package metadata
+*.egg-info/
+dist/
+build/
+
+# Version control
+.git/
+.gitignore
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Application temp directories
+stems_upload_*/
+stems_output_*/
+
+# Documentation (not needed in container)
+README.md
+LICENSE
+*.md
+
+# CI/CD files
+.github/
+.gitlab-ci.yml
+
+# Environment variables (NEVER include these!)
+.env
+.env.local
+*.pem
+*.key
