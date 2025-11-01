@@ -1,8 +1,3 @@
-# audioProcessingService.py
-# Full Flask service for audio separation with Demucs + FFmpeg.
-# Sends results back to Base44 callback with required headers:
-# - Authorization: Bearer <PYTHON_SERVICE_KEY>
-# - Base44-App-Id: <BASE44_APP_ID>  (value is forwarded to Python via form field)
 
 import os
 import sys
@@ -52,7 +47,7 @@ UPLOAD_FOLDER = tempfile.mkdtemp(prefix="audio_upload_")
 OUTPUT_FOLDER = tempfile.mkdtemp(prefix="audio_output_")
 
 logger.info("=" * 80)
-logger.info("🚀 PYTHON SERVICE STARTING")
+logger.info("🚀 PYTHON SERVICE STARTING (STREAMING MODE)")
 logger.info(f"📁 Upload folder: {UPLOAD_FOLDER}")
 logger.info(f"📁 Output folder: {OUTPUT_FOLDER}")
 logger.info(f"🐍 Python: {sys.version.split()[0]}  exec: {sys.executable}")
@@ -73,19 +68,85 @@ def cleanup_temp_dirs():
 
 atexit.register(cleanup_temp_dirs)
 
-# ── Background worker (one-shot/legacy send) ───────────────────────────────────
-def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_app_id):
+# ── Helper: Send partial stem ──────────────────────────────────────────────────
+def send_partial_stem(job_id, callback_url, project_id, base44_app_id, part_name, wav_path):
     """
-    Runs Demucs, encodes stems to base64, and POSTs a single result payload
-    back to Base44 with both required headers.
+    Sends a single stem to Base44 as soon as it's ready.
+    Uses mode="partial" for streaming.
     """
     try:
-        logger.info(f"🎸 [{job_id}] Worker start")
+        logger.info(f"📤 [{job_id}] Sending {part_name} to callback...")
+        
+        # Read and encode stem
+        with open(wav_path, "rb") as f:
+            b64_data = base64.b64encode(f.read()).decode("utf-8")
+        
+        # Send immediately
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
+            "Base44-App-Id": base44_app_id,
+        }
+        payload = {
+            "project_id": project_id,
+            "mode": "partial",
+            "part": part_name,
+            "data_base64": b64_data,
+        }
+        
+        resp = requests.post(callback_url, json=payload, headers=headers, timeout=120)
+        logger.info(f"✅ [{job_id}] {part_name} uploaded! Status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            logger.warning(f"⚠️ [{job_id}] Callback returned {resp.status_code}: {resp.text[:200]}")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ [{job_id}] Failed to send {part_name}: {e}")
+        return False
+
+# ── Helper: Send finalization ──────────────────────────────────────────────────
+def send_done_signal(job_id, callback_url, project_id, base44_app_id):
+    """
+    Sends final 'done' signal to mark processing as complete.
+    """
+    try:
+        logger.info(f"🏁 [{job_id}] Sending completion signal...")
+        
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
+            "Base44-App-Id": base44_app_id,
+        }
+        payload = {
+            "project_id": project_id,
+            "mode": "done",
+        }
+        
+        resp = requests.post(callback_url, json=payload, headers=headers, timeout=60)
+        logger.info(f"✅ [{job_id}] Completion signal sent! Status: {resp.status_code}")
+        
+        if resp.status_code != 200:
+            logger.warning(f"⚠️ [{job_id}] Done callback returned {resp.status_code}")
+        
+    except Exception as e:
+        logger.error(f"❌ [{job_id}] Failed to send done signal: {e}")
+
+# ── Background worker (STREAMING MODE) ─────────────────────────────────────────
+def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_app_id):
+    """
+    Runs Demucs and sends each stem to Base44 AS SOON AS IT'S READY.
+    This provides real-time progress feedback to the user!
+    """
+    try:
+        logger.info(f"🎸 [{job_id}] Worker start (STREAMING)")
         logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
         logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
         logger.info(f"🆔 [{job_id}] Base44 App ID: {base44_app_id}")
 
-        # 1) Separate stems with Demucs using current venv's Python
+        # 1) Separate stems with Demucs
         demucs_cmd = [
             sys.executable, "-m", "demucs",
             "-o", OUTPUT_FOLDER,
@@ -112,43 +173,36 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
             logger.error(f"OUTPUT_FOLDER contents: {contents}")
             raise Exception(f"Output dir not found: {out_dir}")
 
-        # 3) Read stems → base64
+        # 3) STREAMING: Send each stem as soon as it's ready!
         stem_files = {
             "vocals": os.path.join(out_dir, "vocals.wav"),
             "drums":  os.path.join(out_dir, "drums.wav"),
             "bass":   os.path.join(out_dir, "bass.wav"),
             "other":  os.path.join(out_dir, "other.wav"),
         }
-        stems_b64 = {}
-        for name, path in stem_files.items():
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("utf-8")
-                stems_b64[name] = b64
-                logger.info(f"✅ [{job_id}] Encoded {name}")
+        
+        uploaded_count = 0
+        for stem_name, stem_path in stem_files.items():
+            if os.path.exists(stem_path):
+                success = send_partial_stem(
+                    job_id, callback_url, project_id, base44_app_id, 
+                    stem_name, stem_path
+                )
+                if success:
+                    uploaded_count += 1
+                    # Delete stem after successful upload to save space
+                    try:
+                        os.remove(stem_path)
+                    except Exception as e:
+                        logger.warning(f"⚠️ [{job_id}] Could not delete {stem_name}: {e}")
             else:
-                logger.warning(f"⚠️ [{job_id}] Missing stem: {name}")
+                logger.warning(f"⚠️ [{job_id}] Missing stem: {stem_name}")
 
-        if not stems_b64:
-            raise Exception("No stems generated by Demucs")
+        if uploaded_count == 0:
+            raise Exception("No stems generated or uploaded successfully")
 
-        # 4) POST back to Base44 callback (include BOTH required headers)
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-            "Base44-App-Id": base44_app_id,          # ← REQUIRED by Base44
-        }
-        payload = {
-            "project_id": project_id,
-            "success": True,
-            "stems_base64": stems_b64,               # legacy/one-shot mode
-        }
-
-        cb_resp = requests.post(callback_url, json=payload, headers=headers, timeout=120)
-        logger.info(f"📥 [{job_id}] Callback status: {cb_resp.status_code}")
-        logger.debug(f"📥 [{job_id}] Callback body: {cb_resp.text[:500]}")
-        if cb_resp.status_code != 200:
-            raise Exception(f"Callback failed: {cb_resp.status_code} {cb_resp.text[:200]}")
+        # 4) Send completion signal
+        send_done_signal(job_id, callback_url, project_id, base44_app_id)
 
         # 5) Cleanup
         try:
@@ -158,16 +212,16 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
         except Exception as e:
             logger.warning(f"Cleanup warn: {e}")
 
-        logger.info(f"🎉 [{job_id}] Done")
+        logger.info(f"🎉 [{job_id}] COMPLETE! Uploaded {uploaded_count} stems")
 
     except Exception as e:
         logger.error(f"❌ [{job_id}] FAIL: {e}")
-        # Best-effort error callback (send both headers here too)
+        # Best-effort error callback
         try:
             err_headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-                "Base44-App-Id": base44_app_id,      # ← keep on error as well
+                "Base44-App-Id": base44_app_id,
             }
             requests.post(
                 callback_url,
@@ -237,13 +291,13 @@ def separate_stems():
 
         return jsonify({
             "success": True,
-            "message": "Job started",
+            "message": "Job started (streaming mode)",
             "job_id": job_id,
             "project_id": project_id,
         }), 202
 
     except Exception as e:
-        # Immediate error path: best-effort notify Base44 if we have fields
+        # Immediate error path: best-effort notify Base44
         try:
             if "callback_url" in locals() and "project_id" in locals() and "base44_app_id" in locals():
                 headers = {
@@ -265,7 +319,7 @@ def separate_stems():
 def health():
     return jsonify({
         "status": "healthy",
-        "service": "audio-processing-service",
+        "service": "audio-processing-service (streaming)",
         "python_version": sys.version.split()[0],
         "torch_version": TORCH_VER,
         "cuda_available": CUDA_OK,
@@ -274,8 +328,9 @@ def health():
 # ── Entrypoint ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🌐 Starting Flask server on port {port}")
+    logger.info(f"🌐 Starting Flask server on port {port} (STREAMING MODE)")
     app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
 
 
 
