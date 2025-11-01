@@ -46,7 +46,7 @@ def cleanup_temp_dirs():
 
 atexit.register(cleanup_temp_dirs)
 
-def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_service_key):
+def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_service_key, base44_app_id):
     """Background worker function"""
     try:
         logger.info(f"🎸 [{job_id}] Background worker started")
@@ -178,7 +178,8 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
             callback_url,
             headers={
                 'Content-Type': 'application/json',
-                'Authorization': f'Bearer {base44_service_key}'
+                'Authorization': f'Bearer {base44_service_key}',
+                'Base44-App-Id': base44_app_id
             },
             json=callback_payload,
             timeout=30
@@ -214,7 +215,8 @@ def process_job_async(job_id, input_path, wav_path, callback_url, project_id, ba
                     callback_url,
                     headers={
                         'Content-Type': 'application/json',
-                        'Authorization': f'Bearer {base44_service_key}'
+                        'Authorization': f'Bearer {base44_service_key}',
+                        'Base44-App-Id': base44_app_id
                     },
                     json={
                         'project_id': project_id,
@@ -242,7 +244,7 @@ def health_check():
 @app.route('/separate_stems', methods=['POST'])
 def separate_stems():
     """
-    ASYNC: Accepts file, returns immediately, processes in background
+    SIMPLIFIED: ONLY SEPARATES STEMS, NOTHING ELSE
     """
     job_id = str(uuid.uuid4())[:8]
     
@@ -267,16 +269,19 @@ def separate_stems():
         callback_url = request.form.get('callback_url')
         project_id = request.form.get('project_id')
         base44_service_key = request.form.get('base44_service_key')
+        base44_app_id = request.form.get('base44_app_id')
         
         logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
         logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
         logger.info(f"🔑 [{job_id}] Service key received: {bool(base44_service_key)}")
+        logger.info(f"🆔 [{job_id}] App ID received: {bool(base44_app_id)}")
         
-        if not callback_url or not project_id:
+        if not callback_url or not project_id or not base44_app_id:
             logger.error(f"❌ [{job_id}] Missing required parameters")
             logger.error(f"   callback_url: {callback_url}")
             logger.error(f"   project_id: {project_id}")
-            return jsonify({'error': 'Missing callback_url or project_id'}), 400
+            logger.error(f"   base44_app_id: {base44_app_id}")
+            return jsonify({'error': 'Missing callback_url, project_id, or base44_app_id'}), 400
         
         # Save uploaded file
         input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input{os.path.splitext(file.filename)[1]}")
@@ -291,13 +296,19 @@ def separate_stems():
         wav_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_input.wav")
         if not input_path.endswith('.wav'):
             logger.info(f"🔄 [{job_id}] Converting to WAV...")
+            logger.debug(f"🔄 [{job_id}] FFmpeg command: ffmpeg -i {input_path} -ar 44100 -ac 2 -y {wav_path}")
             
             result = subprocess.run([
                 'ffmpeg', '-i', input_path, '-ar', '44100', '-ac', '2', '-y', wav_path
             ], capture_output=True, text=True)
             
+            logger.debug(f"📤 [{job_id}] FFmpeg stdout: {result.stdout}")
+            logger.debug(f"📤 [{job_id}] FFmpeg stderr: {result.stderr}")
+            
             if result.returncode != 0:
                 logger.error(f"❌ [{job_id}] FFmpeg conversion failed")
+                logger.error(f"   Return code: {result.returncode}")
+                logger.error(f"   Stderr: {result.stderr}")
                 raise Exception(f"FFmpeg conversion failed: {result.stderr}")
             
             logger.info(f"✅ [{job_id}] Conversion complete")
@@ -306,18 +317,18 @@ def separate_stems():
             shutil.copy(input_path, wav_path)
             logger.info(f"✅ [{job_id}] File copied")
         
+        wav_size = os.path.getsize(wav_path)
+        logger.info(f"📊 [{job_id}] WAV file size: {wav_size} bytes ({wav_size / 1024 / 1024:.2f} MB)")
+        
         # Start background thread
         thread = threading.Thread(
             target=process_job_async,
-            args=(job_id, input_path, wav_path, callback_url, project_id, base44_service_key)
+            args=(job_id, input_path, wav_path, callback_url, project_id, base44_service_key, base44_app_id)
         )
         thread.daemon = True
         thread.start()
         
         logger.info(f"✅ [{job_id}] Background job started, returning immediately")
-        logger.info('=' * 80)
-        logger.info(f"📤 [{job_id}] RETURNING SUCCESS TO CLIENT")
-        logger.info('=' * 80)
         
         # Return immediately
         return jsonify({
@@ -333,6 +344,7 @@ def separate_stems():
         logger.error(f"Error type: {type(e).__name__}")
         logger.error(f"Error message: {str(e)}")
         logger.exception(f"Full traceback:")
+        
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
@@ -341,7 +353,6 @@ if __name__ == '__main__':
     logger.info(f"🚀 Starting Flask server on port {port}")
     logger.info('=' * 80)
     app.run(host='0.0.0.0', port=port, debug=False)
-
 
 
 
