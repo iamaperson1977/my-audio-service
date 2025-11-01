@@ -12,7 +12,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # CRITICAL: Allow frontend to call backend
+CORS(app)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -22,7 +22,6 @@ OUTPUT_FOLDER = tempfile.mkdtemp(prefix='audio_output_')
 
 @app.route('/separate_stems', methods=['POST'])
 def separate_stems():
-    """Separates audio into stems using demucs. Returns base64 encoded MP3s."""
     input_path = None
     output_dir = None
     
@@ -42,11 +41,11 @@ def separate_stems():
         output_dir = os.path.join(OUTPUT_FOLDER, f"{unique_id}_stems")
         
         file.save(input_path)
-        logger.info(f"📁 Saved: {input_path}")
+        logger.info(f"Saved: {input_path}")
         
         os.makedirs(output_dir, exist_ok=True)
         
-        logger.info(f"🎵 Running Demucs...")
+        logger.info(f"Running Demucs...")
         start_time = time.time()
         
         subprocess.run([
@@ -60,9 +59,8 @@ def separate_stems():
         ], check=True, capture_output=True, text=True, timeout=600)
         
         processing_time = time.time() - start_time
-        logger.info(f"✅ Demucs complete in {processing_time:.1f}s")
+        logger.info(f"Demucs complete in {processing_time:.1f}s")
         
-        # Find stems directory
         stem_track_dir = os.path.join(output_dir, 'htdemucs', os.path.splitext(os.path.basename(input_path))[0])
         
         if not os.path.exists(stem_track_dir):
@@ -79,25 +77,24 @@ def separate_stems():
             if os.path.exists(stem_file):
                 with open(stem_file, 'rb') as f:
                     stems_data[stem_name] = base64.b64encode(f.read()).decode('utf-8')
-                logger.info(f"✅ Encoded {stem_name}.mp3")
+                logger.info(f"Encoded {stem_name}.mp3")
         
         if not stems_data:
             raise ValueError("No stems were created")
 
-        logger.info(f"🎉 Success! Returning {len(stems_data)} stems")
+        logger.info(f"Success! Returning {len(stems_data)} stems")
         return jsonify(stems_data), 200
     
     except subprocess.TimeoutExpired:
-        logger.error("❌ Processing timeout")
-        return jsonify({"error": "Processing timeout - file too long (max 10 minutes)"}), 500
+        logger.error("Processing timeout")
+        return jsonify({"error": "Processing timeout - file too long"}), 500
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Demucs failed: {e.stderr}")
+        logger.error(f"Demucs failed: {e.stderr}")
         return jsonify({"error": "Stem separation failed", "details": str(e.stderr)[:200]}), 500
     except Exception as e:
-        logger.error(f"❌ Error: {e}")
+        logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
     finally:
-        # CRITICAL: Always cleanup, even if error
         try:
             if input_path and os.path.exists(input_path):
                 os.remove(input_path)
@@ -114,9 +111,7 @@ def separate_stems():
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Health check endpoint."""
     try:
-        # Check demucs is available
         result = subprocess.run(
             [sys.executable, '-m', 'demucs', '--help'],
             capture_output=True,
@@ -124,7 +119,6 @@ def health():
         )
         demucs_ok = result.returncode == 0
         
-        # Check ffmpeg
         ffmpeg_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
         ffmpeg_ok = ffmpeg_result.returncode == 0
         
@@ -136,36 +130,20 @@ def health():
     except Exception as e:
         return jsonify({"status": "unhealthy", "error": str(e)}), 500
 
-@app.route('/', methods=['GET'])
-def root():
-    """API info."""
-    return jsonify({
-        "service": "Stem Separation API",
-        "version": "1.0",
-        "endpoints": {
-            "POST /separate_stems": "Separate audio into 4 stems",
-            "GET /health": "Health check"
-        }
-    }), 200
-
 if __name__ == '__main__':
     import atexit
     
     def cleanup():
-        """Cleanup on shutdown."""
         for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
             if os.path.exists(folder):
                 try:
                     shutil.rmtree(folder)
-                    logger.info(f"Shutdown cleanup: {folder}")
                 except Exception as e:
                     logger.error(f"Cleanup error: {e}")
     
     atexit.register(cleanup)
     
-    # CRITICAL: Get port from Railway environment
-    port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🚀 Starting server on port {port}")
+    port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 
