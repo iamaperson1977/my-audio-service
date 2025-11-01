@@ -1,335 +1,582 @@
-
 import os
-import sys
 import uuid
-import logging
+import subprocess
+import sys
+import json
+import base64
 import tempfile
 import shutil
-import subprocess
-import atexit
-import requests
-import threading
-import base64
-from urllib.parse import urlparse
-
+import logging
 from flask import Flask, request, jsonify
 
-# ── Optional torch (for health/logging only) ───────────────────────────────────
-try:
-    import torch  # noqa: F401
-    TORCH_VER = torch.__version__
-    CUDA_OK = bool(torch.cuda.is_available())
-except Exception:
-    torch = None
-    TORCH_VER = "unavailable"
-    CUDA_OK = False
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ── Logging ────────────────────────────────────────────────────────────────────
+UPLOAD_FOLDER = tempfile.mkdtemp(prefix='audio_upload_')
+OUTPUT_FOLDER = tempfile.mkdtemp(prefix='audio_output_')
+
+@app.route('/separate_stems', methods=['POST'])
+def separate_stems():
+    """Separates audio into stems using demucs. Returns base64 encoded MP3s."""
+    input_path = None
+    output_dir = None
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({"error": "No audio file provided"}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
+        
+        unique_id = str(uuid.uuid4())
+        filename_parts = file.filename.rsplit('.', 1)
+        file_ext = filename_parts[1].lower() if len(filename_parts) > 1 else 'mp3'
+        
+        input_path = os.path.join(UPLOAD_FOLDER, f"{unique_id}_input.{file_ext}")
+        output_dir = os.path.join(OUTPUT_FOLDER, f"{unique_id}_stems")
+        
+        file.save(input_path)
+        logging.info(f"📁 Saved: {input_path}")
+        
+        os.makedirs(output_dir, exist_ok=True)
+        
+        logging.info(f"🎵 Running Demucs FAST...")
+        
+        subprocess.run([
+            sys.executable, '-m', 'demucs.separate',
+            '-n', 'htdemucs',
+            '-o', output_dir,
+            '--mp3',
+            '--mp3-bitrate', '192',
+            '--jobs', '2',
+            input_path
+        ], check=True, capture_output=True, text=True, timeout=600)
+        
+        logging.info(f"✅ Demucs complete")
+        
+        # Find stems directory
+        stem_track_dir = os.path.join(output_dir, 'htdemucs', os.path.splitext(os.path.basename(input_path))[0])
+        
+        if not os.path.exists(stem_track_dir):
+            for root, dirs, files in os.walk(output_dir):
+                if any(f.endswith('.mp3') for f in files):
+                    stem_track_dir = root
+                    break
+        
+        logging.info(f"Stems: {stem_track_dir}")
+
+        stems_data = {}
+        for stem_name in ['vocals', 'drums', 'bass', 'other']:
+            stem_file = os.path.join(stem_track_dir, f"{stem_name}.mp3")
+            if os.path.exists(stem_file):
+                with open(stem_file, 'rb') as f:
+                    stems_data[stem_name] = base64.b64encode(f.read()).decode('utf-8')
+                logging.info(f"✅ {stem_name}.mp3")
+        
+        if not stems_data:
+            raise ValueError("No stems created")
+
+        logging.info("🎉 Complete!")
+        return jsonify(stems_data), 200
+    
+    except subprocess.TimeoutExpired:
+        logging.error("❌ Timeout")
+        return jsonify({"error": "Timeout - file too long"}), 500
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ Demucs failed: {e.stderr}")
+        return jsonify({"error": "Separation failed", "details": e.stderr}), 500
+    except Exception as e:
+        logging.error(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        try:
+            if input_path and os.path.exists(input_path):
+                os.remove(input_path)
+            if output_dir and os.path.exists(output_dir):
+                shutil.rmtree(output_dir)
+        except Exception as e:
+            logging.error(f"Cleanup error: {e}")
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+if __name__ == '__main__':
+    import atexit
+    
+    def cleanup():
+        for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
+            if os.path.exists(folder):
+                try:
+                    shutil.rmtree(folder)
+                except Exception as e:
+                    logging.error(f"Cleanup error: {e}")
+    
+    atexit.register(cleanup)
+    app.run(host='0.0.0.0', port=5000, debug=False)
+🚀 DEPLOYMENT STEPS:
+
+Create requirements.txt:
+flask
+demucs
+torch
+torchaudio
+Deploy to Railway:
+
+Connect your GitHub repo
+Railway auto-detects Flask
+Get your URL: https://your-app.railway.app
+Update Frontend:
+
+In pages/Processing.js line 48, change:
+const BACKEND_URL = "https://your-app.railway.app";
+✨ What this does:
+
+Python backend: ONLY Demucs separation → returns base64 MP3s
+Base44 function: Receives base64 → uploads to Base44 storage → saves to database
+Frontend: Orchestrates everything, shows players with volume controls
+Ready to deploy! 🎵
+
+4 minutes ago
+OKAY CAN I HAVE THE CODE TO GIVE TO THE GITHUB PLEASE. MAKE SURE ITS PERFECT THINK ABOUT EVERYTHING THAT CAN GO WRONG AND AVOID IT WHIKE WRITING THIS .PY CODE
+
+2 minutes ago
+Revert this
+Base44 AI
+Base44
+
+Thought for 5s
+Here's your PRODUCTION-READY code for GitHub/Railway deployment:
+
+📁 app.py (Main Flask Backend)
+import os
+import uuid
+import subprocess
+import sys
+import json
+import base64
+import tempfile
+import shutil
+import logging
+import signal
+from pathlib import Path
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import time
+
+# ==================== CONFIGURATION ====================
+app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Logging setup
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# ── Flask app ──────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200 MB cap
+# Configuration
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB max file size
+ALLOWED_EXTENSIONS = {'mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'opus'}
+DEMUCS_TIMEOUT = 600  # 10 minutes max processing time
+UPLOAD_FOLDER = tempfile.mkdtemp(prefix='stems_upload_')
+OUTPUT_FOLDER = tempfile.mkdtemp(prefix='stems_output_')
 
-# ── Env & paths ────────────────────────────────────────────────────────────────
-PYTHON_SERVICE_KEY = os.environ.get("PYTHON_SERVICE_KEY")
-if not PYTHON_SERVICE_KEY:
-    raise Exception("PYTHON_SERVICE_KEY environment variable required")
+# Ensure directories exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-# If you set FFMPEG_PATH in Railway, it will use that; otherwise 'ffmpeg' on PATH
-FFMPEG_BIN = os.environ.get("FFMPEG_PATH", "ffmpeg")
+logger.info(f"Upload folder: {UPLOAD_FOLDER}")
+logger.info(f"Output folder: {OUTPUT_FOLDER}")
 
-UPLOAD_FOLDER = tempfile.mkdtemp(prefix="audio_upload_")
-OUTPUT_FOLDER = tempfile.mkdtemp(prefix="audio_output_")
+# ==================== HELPER FUNCTIONS ====================
 
-logger.info("=" * 80)
-logger.info("🚀 PYTHON SERVICE STARTING (STREAMING MODE)")
-logger.info(f"📁 Upload folder: {UPLOAD_FOLDER}")
-logger.info(f"📁 Output folder: {OUTPUT_FOLDER}")
-logger.info(f"🐍 Python: {sys.version.split()[0]}  exec: {sys.executable}")
-logger.info(f"🎬 FFmpeg: {FFMPEG_BIN}")
-logger.info(f"🔥 Torch: {TORCH_VER}  CUDA: {CUDA_OK}")
-logger.info("=" * 80)
+def allowed_file(filename):
+    """Check if file extension is allowed."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# ── Cleanup on exit ────────────────────────────────────────────────────────────
-def cleanup_temp_dirs():
+def cleanup_file(filepath):
+    """Safely delete a file."""
     try:
-        if os.path.exists(UPLOAD_FOLDER):
-            shutil.rmtree(UPLOAD_FOLDER)
-        if os.path.exists(OUTPUT_FOLDER):
-            shutil.rmtree(OUTPUT_FOLDER)
-        logger.info("🧹 Temp directories cleaned up")
+        if filepath and os.path.exists(filepath):
+            os.remove(filepath)
+            logger.info(f"Cleaned up: {filepath}")
     except Exception as e:
-        logger.error(f"Cleanup error: {e}")
+        logger.error(f"Failed to cleanup {filepath}: {e}")
 
-atexit.register(cleanup_temp_dirs)
-
-# ── Helper: Send partial stem ──────────────────────────────────────────────────
-def send_partial_stem(job_id, callback_url, project_id, base44_app_id, part_name, wav_path):
-    """
-    Sends a single stem to Base44 as soon as it's ready.
-    Uses mode="partial" for streaming.
-    """
+def cleanup_directory(directory):
+    """Safely delete a directory and all contents."""
     try:
-        logger.info(f"📤 [{job_id}] Sending {part_name} to callback...")
+        if directory and os.path.exists(directory):
+            shutil.rmtree(directory)
+            logger.info(f"Cleaned up directory: {directory}")
+    except Exception as e:
+        logger.error(f"Failed to cleanup directory {directory}: {e}")
+
+def kill_process_tree(pid):
+    """Kill a process and all its children."""
+    try:
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            child.kill()
+        parent.kill()
+    except:
+        pass
+
+def validate_audio_file(filepath):
+    """Validate that the file is actually an audio file."""
+    try:
+        # Try to get file info using ffprobe
+        result = subprocess.run([
+            'ffprobe', '-v', 'error', '-show_format', '-show_streams',
+            '-print_format', 'json', filepath
+        ], capture_output=True, text=True, timeout=10)
         
-        # Read and encode stem
-        with open(wav_path, "rb") as f:
-            b64_data = base64.b64encode(f.read()).decode("utf-8")
+        if result.returncode != 0:
+            return False, "Invalid audio file"
         
-        # Send immediately
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-            "Base44-App-Id": base44_app_id,
-        }
-        payload = {
-            "project_id": project_id,
-            "mode": "partial",
-            "part": part_name,
-            "data_base64": b64_data,
-        }
+        data = json.loads(result.stdout)
         
-        resp = requests.post(callback_url, json=payload, headers=headers, timeout=120)
-        logger.info(f"✅ [{job_id}] {part_name} uploaded! Status: {resp.status_code}")
+        # Check if it has audio streams
+        has_audio = any(stream.get('codec_type') == 'audio' 
+                       for stream in data.get('streams', []))
         
-        if resp.status_code != 200:
-            logger.warning(f"⚠️ [{job_id}] Callback returned {resp.status_code}: {resp.text[:200]}")
+        if not has_audio:
+            return False, "No audio stream found"
+        
+        # Check duration (optional - reject files longer than 15 minutes)
+        duration = float(data.get('format', {}).get('duration', 0))
+        if duration > 900:  # 15 minutes
+            return False, "Audio file too long (max 15 minutes)"
+        
+        if duration < 1:
+            return False, "Audio file too short"
+        
+        return True, "Valid audio file"
+    
+    except subprocess.TimeoutExpired:
+        return False, "File validation timeout"
+    except json.JSONDecodeError:
+        return False, "Could not parse audio metadata"
+    except Exception as e:
+        logger.error(f"Validation error: {e}")
+        return False, f"Validation failed: {str(e)}"
+
+def convert_to_wav(input_path, output_path):
+    """Convert audio file to WAV format using ffmpeg."""
+    try:
+        logger.info(f"Converting {input_path} to WAV...")
+        
+        result = subprocess.run([
+            'ffmpeg', '-i', input_path,
+            '-ar', '44100',  # Sample rate
+            '-ac', '2',      # Stereo
+            '-y',            # Overwrite output
+            output_path
+        ], capture_output=True, text=True, timeout=60)
+        
+        if result.returncode != 0:
+            logger.error(f"FFmpeg error: {result.stderr}")
             return False
         
-        return True
+        if not os.path.exists(output_path):
+            logger.error(f"Conversion failed: output file not created")
+            return False
         
+        logger.info(f"✅ Converted to WAV: {output_path}")
+        return True
+    
+    except subprocess.TimeoutExpired:
+        logger.error("FFmpeg conversion timeout")
+        return False
     except Exception as e:
-        logger.error(f"❌ [{job_id}] Failed to send {part_name}: {e}")
+        logger.error(f"Conversion error: {e}")
         return False
 
-# ── Helper: Send finalization ──────────────────────────────────────────────────
-def send_done_signal(job_id, callback_url, project_id, base44_app_id):
-    """
-    Sends final 'done' signal to mark processing as complete.
-    """
-    try:
-        logger.info(f"🏁 [{job_id}] Sending completion signal...")
-        
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-            "Base44-App-Id": base44_app_id,
-        }
-        payload = {
-            "project_id": project_id,
-            "mode": "done",
-        }
-        
-        resp = requests.post(callback_url, json=payload, headers=headers, timeout=60)
-        logger.info(f"✅ [{job_id}] Completion signal sent! Status: {resp.status_code}")
-        
-        if resp.status_code != 200:
-            logger.warning(f"⚠️ [{job_id}] Done callback returned {resp.status_code}")
-        
-    except Exception as e:
-        logger.error(f"❌ [{job_id}] Failed to send done signal: {e}")
+# ==================== MAIN ENDPOINT ====================
 
-# ── Background worker (STREAMING MODE) ─────────────────────────────────────────
-def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_app_id):
-    """
-    Runs Demucs and sends each stem to Base44 AS SOON AS IT'S READY.
-    This provides real-time progress feedback to the user!
-    """
-    try:
-        logger.info(f"🎸 [{job_id}] Worker start (STREAMING)")
-        logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
-        logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
-        logger.info(f"🆔 [{job_id}] Base44 App ID: {base44_app_id}")
-
-        # 1) Separate stems with Demucs
-        demucs_cmd = [
-            sys.executable, "-m", "demucs",
-            "-o", OUTPUT_FOLDER,
-            "-n", "mdx_extra",
-            "--segment", "10",
-            "--jobs", "2",
-            wav_path,
-        ]
-        logger.info(f"🔧 [{job_id}] Demucs: {' '.join(demucs_cmd)}")
-        demucs_res = subprocess.run(
-            demucs_cmd, capture_output=True, text=True, timeout=1800
-        )
-        logger.debug(f"📤 [{job_id}] Demucs stdout:\n{demucs_res.stdout}")
-        logger.debug(f"📤 [{job_id}] Demucs stderr:\n{demucs_res.stderr}")
-        if demucs_res.returncode != 0:
-            raise Exception(f"Demucs failed: {demucs_res.stderr}")
-
-        # 2) Demucs output dir: OUTPUT_FOLDER/mdx_extra/<basename>
-        base_name = os.path.splitext(os.path.basename(wav_path))[0]
-        out_dir = os.path.join(OUTPUT_FOLDER, "mdx_extra", base_name)
-        logger.info(f"📂 [{job_id}] Checking output dir: {out_dir}")
-        if not os.path.exists(out_dir):
-            contents = "; ".join(os.listdir(OUTPUT_FOLDER))
-            logger.error(f"OUTPUT_FOLDER contents: {contents}")
-            raise Exception(f"Output dir not found: {out_dir}")
-
-        # 3) STREAMING: Send each stem as soon as it's ready!
-        stem_files = {
-            "vocals": os.path.join(out_dir, "vocals.wav"),
-            "drums":  os.path.join(out_dir, "drums.wav"),
-            "bass":   os.path.join(out_dir, "bass.wav"),
-            "other":  os.path.join(out_dir, "other.wav"),
-        }
-        
-        uploaded_count = 0
-        for stem_name, stem_path in stem_files.items():
-            if os.path.exists(stem_path):
-                success = send_partial_stem(
-                    job_id, callback_url, project_id, base44_app_id, 
-                    stem_name, stem_path
-                )
-                if success:
-                    uploaded_count += 1
-                    # Delete stem after successful upload to save space
-                    try:
-                        os.remove(stem_path)
-                    except Exception as e:
-                        logger.warning(f"⚠️ [{job_id}] Could not delete {stem_name}: {e}")
-            else:
-                logger.warning(f"⚠️ [{job_id}] Missing stem: {stem_name}")
-
-        if uploaded_count == 0:
-            raise Exception("No stems generated or uploaded successfully")
-
-        # 4) Send completion signal
-        send_done_signal(job_id, callback_url, project_id, base44_app_id)
-
-        # 5) Cleanup
-        try:
-            if os.path.exists(input_path): os.remove(input_path)
-            if os.path.exists(wav_path): os.remove(wav_path)
-            if os.path.exists(out_dir): shutil.rmtree(out_dir)
-        except Exception as e:
-            logger.warning(f"Cleanup warn: {e}")
-
-        logger.info(f"🎉 [{job_id}] COMPLETE! Uploaded {uploaded_count} stems")
-
-    except Exception as e:
-        logger.error(f"❌ [{job_id}] FAIL: {e}")
-        # Best-effort error callback
-        try:
-            err_headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-                "Base44-App-Id": base44_app_id,
-            }
-            requests.post(
-                callback_url,
-                json={"project_id": project_id, "success": False, "error": str(e)},
-                headers=err_headers,
-                timeout=30,
-            )
-        except Exception as e2:
-            logger.error(f"Callback error: {e2}")
-
-# ── Routes ─────────────────────────────────────────────────────────────────────
-@app.route("/separate_stems", methods=["POST"])
+@app.route('/separate_stems', methods=['POST'])
 def separate_stems():
     """
-    Accepts:
-      file: audio file (multipart)
-      callback_url: Base44 function URL to POST results to
-      project_id: your Base44 Project id
-      base44_app_id: YOUR Base44 App Id (used for 'Base44-App-Id' header)
-
-    Starts a background thread to process and callback.
+    Separate audio into stems using Demucs.
+    Returns base64-encoded MP3 files for each stem.
     """
-    job_id = str(uuid.uuid4())[:8]
+    input_path = None
+    wav_path = None
+    output_dir = None
+    unique_id = str(uuid.uuid4())
+    
     try:
-        if "file" not in request.files:
-            return jsonify({"error": "No file provided"}), 400
-
-        file = request.files["file"]
-        callback_url = request.form.get("callback_url")
-        project_id = request.form.get("project_id")
-        base44_app_id = request.form.get("base44_app_id")
-
-        # Validation
-        if not callback_url or not project_id or not base44_app_id:
-            return jsonify({"error": "Missing callback_url, project_id, or base44_app_id"}), 400
-        u = urlparse(callback_url)
-        if u.scheme not in ("http", "https") or not u.netloc:
-            return jsonify({"error": "Invalid callback_url"}), 400
-
-        # Save original upload
-        input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_{file.filename}")
-        file.save(input_path)
-
-        # Convert to WAV (44.1kHz, stereo)
-        wav_path = os.path.join(UPLOAD_FOLDER, f"{job_id}.wav")
-        ffmpeg_cmd = [
-            FFMPEG_BIN, "-threads", "0",
-            "-i", input_path,
-            "-ar", "44100",
-            "-ac", "2",
-            "-loglevel", "error",
-            "-y", wav_path,
-        ]
-        logger.info(f"🔧 [{job_id}] FFmpeg: {' '.join(ffmpeg_cmd)}")
-        ffm_res = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=600)
-        if ffm_res.returncode != 0:
-            return jsonify({"error": f"FFmpeg failed: {ffm_res.stderr}"}), 500
-
-        # Start background worker
-        thread = threading.Thread(
-            target=process_job_async,
-            args=(job_id, input_path, wav_path, callback_url, project_id, base44_app_id),
-            name=f"job-{job_id}",
-            daemon=True,
-        )
-        thread.start()
-
-        return jsonify({
-            "success": True,
-            "message": "Job started (streaming mode)",
-            "job_id": job_id,
-            "project_id": project_id,
-        }), 202
-
-    except Exception as e:
-        # Immediate error path: best-effort notify Base44
+        # ===== VALIDATION =====
+        if 'file' not in request.files:
+            logger.warning("No file in request")
+            return jsonify({"error": "No audio file provided"}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            logger.warning("Empty filename")
+            return jsonify({"error": "No file selected"}), 400
+        
+        # Check file extension
+        if not allowed_file(file.filename):
+            logger.warning(f"Invalid file type: {file.filename}")
+            return jsonify({
+                "error": f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
+            }), 400
+        
+        # Secure the filename
+        original_filename = secure_filename(file.filename)
+        file_ext = original_filename.rsplit('.', 1)[1].lower()
+        
+        logger.info(f"📁 Processing: {original_filename} (ID: {unique_id})")
+        
+        # ===== SAVE UPLOADED FILE =====
+        input_path = os.path.join(UPLOAD_FOLDER, f"{unique_id}_input.{file_ext}")
+        
         try:
-            if "callback_url" in locals() and "project_id" in locals() and "base44_app_id" in locals():
-                headers = {
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
-                    "Base44-App-Id": base44_app_id,
-                }
-                requests.post(
-                    callback_url,
-                    json={"project_id": project_id, "success": False, "error": str(e)},
-                    headers=headers,
-                    timeout=30,
-                )
-        except Exception:
-            pass
-        return jsonify({"error": str(e), "error_type": type(e).__name__}), 500
+            file.save(input_path)
+        except Exception as e:
+            logger.error(f"Failed to save file: {e}")
+            return jsonify({"error": "Failed to save uploaded file"}), 500
+        
+        # Check file size
+        file_size = os.path.getsize(input_path)
+        if file_size > MAX_FILE_SIZE:
+            cleanup_file(input_path)
+            return jsonify({
+                "error": f"File too large. Max size: {MAX_FILE_SIZE // (1024*1024)}MB"
+            }), 400
+        
+        if file_size < 1024:  # Less than 1KB
+            cleanup_file(input_path)
+            return jsonify({"error": "File too small or corrupted"}), 400
+        
+        logger.info(f"File saved: {input_path} ({file_size / (1024*1024):.2f}MB)")
+        
+        # ===== VALIDATE AUDIO =====
+        is_valid, validation_msg = validate_audio_file(input_path)
+        if not is_valid:
+            cleanup_file(input_path)
+            return jsonify({"error": f"Invalid audio file: {validation_msg}"}), 400
+        
+        logger.info(f"✅ Validation passed: {validation_msg}")
+        
+        # ===== CONVERT TO WAV =====
+        wav_path = os.path.join(UPLOAD_FOLDER, f"{unique_id}_converted.wav")
+        
+        if file_ext != 'wav':
+            if not convert_to_wav(input_path, wav_path):
+                cleanup_file(input_path)
+                return jsonify({"error": "Failed to convert audio file"}), 500
+            cleanup_file(input_path)  # Remove original after conversion
+            input_path = None
+        else:
+            # If already WAV, just rename
+            shutil.move(input_path, wav_path)
+            input_path = None
+        
+        # ===== RUN DEMUCS =====
+        output_dir = os.path.join(OUTPUT_FOLDER, f"{unique_id}_stems")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        logger.info(f"🎵 Running Demucs (htdemucs fast model)...")
+        start_time = time.time()
+        
+        demucs_cmd = [
+            sys.executable, '-m', 'demucs.separate',
+            '-n', 'htdemucs',           # Fast hybrid transformer model
+            '-o', output_dir,            # Output directory
+            '--mp3',                     # Output as MP3
+            '--mp3-bitrate', '192',      # Good quality
+            '--jobs', '2',               # Parallel processing
+            '--float32',                 # Use float32 for better quality
+            wav_path
+        ]
+        
+        try:
+            result = subprocess.run(
+                demucs_cmd,
+                capture_output=True,
+                text=True,
+                timeout=DEMUCS_TIMEOUT,
+                check=True
+            )
+            
+            processing_time = time.time() - start_time
+            logger.info(f"✅ Demucs completed in {processing_time:.1f}s")
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ Demucs timeout after {DEMUCS_TIMEOUT}s")
+            cleanup_file(wav_path)
+            cleanup_directory(output_dir)
+            return jsonify({
+                "error": f"Processing timeout. File may be too long (max {DEMUCS_TIMEOUT//60} min)"
+            }), 500
+        
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ Demucs failed: {e.stderr}")
+            cleanup_file(wav_path)
+            cleanup_directory(output_dir)
+            return jsonify({
+                "error": "Stem separation failed",
+                "details": e.stderr[:500] if e.stderr else "Unknown error"
+            }), 500
+        
+        # ===== FIND STEM FILES =====
+        # Demucs creates: output_dir/htdemucs/filename/vocals.mp3, drums.mp3, etc.
+        base_name = os.path.splitext(os.path.basename(wav_path))[0]
+        stem_dir = os.path.join(output_dir, 'htdemucs', base_name)
+        
+        if not os.path.exists(stem_dir):
+            logger.warning(f"Expected stem directory not found: {stem_dir}")
+            # Try to find stems anywhere in output
+            stem_dir = None
+            for root, dirs, files in os.walk(output_dir):
+                if any(f.endswith('.mp3') for f in files):
+                    stem_dir = root
+                    logger.info(f"Found stems at: {stem_dir}")
+                    break
+        
+        if not stem_dir or not os.path.exists(stem_dir):
+            cleanup_file(wav_path)
+            cleanup_directory(output_dir)
+            return jsonify({"error": "No stems were generated"}), 500
+        
+        # ===== ENCODE STEMS TO BASE64 =====
+        stems_data = {}
+        expected_stems = ['vocals', 'drums', 'bass', 'other']
+        
+        for stem_name in expected_stems:
+            stem_file = os.path.join(stem_dir, f"{stem_name}.mp3")
+            
+            if os.path.exists(stem_file):
+                try:
+                    file_size = os.path.getsize(stem_file)
+                    
+                    if file_size < 100:  # Less than 100 bytes - likely empty
+                        logger.warning(f"⚠️ {stem_name}.mp3 is suspiciously small ({file_size}B)")
+                        continue
+                    
+                    with open(stem_file, 'rb') as f:
+                        stem_bytes = f.read()
+                        stems_data[stem_name] = base64.b64encode(stem_bytes).decode('utf-8')
+                    
+                    logger.info(f"✅ Encoded {stem_name}.mp3 ({file_size / 1024:.1f}KB)")
+                
+                except Exception as e:
+                    logger.error(f"Failed to encode {stem_name}: {e}")
+            else:
+                logger.warning(f"⚠️ Missing {stem_name}.mp3")
+        
+        # ===== VALIDATE RESULTS =====
+        if not stems_data:
+            cleanup_file(wav_path)
+            cleanup_directory(output_dir)
+            return jsonify({"error": "No stems were successfully created"}), 500
+        
+        if len(stems_data) < 4:
+            logger.warning(f"Only {len(stems_data)}/4 stems created: {list(stems_data.keys())}")
+        
+        # ===== CLEANUP =====
+        cleanup_file(wav_path)
+        cleanup_directory(output_dir)
+        
+        logger.info(f"🎉 Success! Returning {len(stems_data)} stems")
+        
+        return jsonify(stems_data), 200
+    
+    except Exception as e:
+        logger.error(f"❌ Unexpected error: {e}", exc_info=True)
+        
+        # Emergency cleanup
+        cleanup_file(input_path)
+        cleanup_file(wav_path)
+        cleanup_directory(output_dir)
+        
+        return jsonify({
+            "error": "Internal server error",
+            "details": str(e)
+        }), 500
 
-@app.route("/health", methods=["GET"])
+# ==================== HEALTH CHECK ====================
+
+@app.route('/health', methods=['GET'])
 def health():
+    """Health check endpoint for Railway."""
+    try:
+        # Check if demucs is available
+        result = subprocess.run(
+            [sys.executable, '-m', 'demucs', '--help'],
+            capture_output=True,
+            timeout=5
+        )
+        demucs_available = result.returncode == 0
+        
+        # Check ffmpeg
+        ffmpeg_result = subprocess.run(
+            ['ffmpeg', '-version'],
+            capture_output=True,
+            timeout=5
+        )
+        ffmpeg_available = ffmpeg_result.returncode == 0
+        
+        return jsonify({
+            "status": "healthy",
+            "service": "Stem Separation API",
+            "demucs": "available" if demucs_available else "unavailable",
+            "ffmpeg": "available" if ffmpeg_available else "unavailable",
+            "upload_folder": UPLOAD_FOLDER,
+            "output_folder": OUTPUT_FOLDER
+        }), 200
+    
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return jsonify({
+            "status": "unhealthy",
+            "error": str(e)
+        }), 500
+
+@app.route('/', methods=['GET'])
+def root():
+    """Root endpoint - API info."""
     return jsonify({
-        "status": "healthy",
-        "service": "audio-processing-service (streaming)",
-        "python_version": sys.version.split()[0],
-        "torch_version": TORCH_VER,
-        "cuda_available": CUDA_OK,
+        "service": "Stem Separation API",
+        "version": "1.0.0",
+        "model": "Demucs htdemucs (fast)",
+        "endpoints": {
+            "POST /separate_stems": "Separate audio into stems",
+            "GET /health": "Health check",
+            "GET /": "This page"
+        },
+        "supported_formats": list(ALLOWED_EXTENSIONS),
+        "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
+        "max_duration_minutes": DEMUCS_TIMEOUT // 60
     }), 200
 
-# ── Entrypoint ─────────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    logger.info(f"🌐 Starting Flask server on port {port} (STREAMING MODE)")
-    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+# ==================== CLEANUP ON EXIT ====================
+
+def cleanup_on_exit():
+    """Clean up temporary directories on shutdown."""
+    logger.info("Cleaning up temporary directories...")
+    cleanup_directory(UPLOAD_FOLDER)
+    cleanup_directory(OUTPUT_FOLDER)
+
+import atexit
+atexit.register(cleanup_on_exit)
+
+# ==================== RUN SERVER ====================
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
 
 
 
