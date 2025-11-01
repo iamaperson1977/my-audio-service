@@ -1,265 +1,247 @@
+# audioProcessingService.py
 import os
 import sys
 import uuid
-import logging
-import tempfile
-import shutil
-import subprocess
-import atexit
-import requests
-import threading
 import base64
-from urllib.parse import urlparse
+import atexit
+import shutil
+import tempfile
+import logging
+import threading
+import subprocess
+from typing import Dict
 
+import requests
 from flask import Flask, request, jsonify
 
-# ── Optional torch (for health/logging only) ───────────────────────────────────
-try:
-    import torch  # noqa: F401
-    TORCH_VER = torch.__version__
-    CUDA_OK = bool(torch.cuda.is_available())
-except Exception:
-    torch = None
-    TORCH_VER = "unavailable"
-    CUDA_OK = False
-
-# ── Logging ────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
+# Logging
+# ────────────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s'
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s",
 )
-logger = logging.getLogger(__name__)
+log = logging.getLogger("audio-service")
 
-# ── Flask app ──────────────────────────────────────────────────────────────────
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB cap
+# ────────────────────────────────────────────────────────────────────────────
+# Env
+# ────────────────────────────────────────────────────────────────────────────
+PYTHON_SERVICE_KEY = os.environ.get("PYTHON_SERVICE_KEY")
+BASE44_APP_ID = os.environ.get("BASE44_APP_ID", "")
+FFMPEG_BIN = os.environ.get("FFMPEG_PATH", "ffmpeg")
 
-# ── Env & paths ────────────────────────────────────────────────────────────────
-PYTHON_SERVICE_KEY = os.environ.get('PYTHON_SERVICE_KEY')
 if not PYTHON_SERVICE_KEY:
-    raise Exception('PYTHON_SERVICE_KEY environment variable required')
+    raise RuntimeError("PYTHON_SERVICE_KEY env var is required")
+if not BASE44_APP_ID:
+    log.warning("BASE44_APP_ID not set (callbacks will be unauthorized on Base44)")
 
-FFMPEG_BIN = os.environ.get('FFMPEG_PATH', 'ffmpeg')
+# ────────────────────────────────────────────────────────────────────────────
+# Flask
+# ────────────────────────────────────────────────────────────────────────────
+app = Flask(__name__)
 
-UPLOAD_FOLDER = tempfile.mkdtemp(prefix="audio_upload_")
-OUTPUT_FOLDER = tempfile.mkdtemp(prefix="audio_output_")
+UPLOAD_DIR = tempfile.mkdtemp(prefix="audio_upload_")
+OUTPUT_DIR = tempfile.mkdtemp(prefix="audio_output_")
 
-logger.info('=' * 80)
-logger.info('🚀 PYTHON SERVICE STARTING')
-logger.info(f"📁 Upload folder: {UPLOAD_FOLDER}")
-logger.info(f"📁 Output folder: {OUTPUT_FOLDER}")
-logger.info(f"🐍 Python: {sys.version.split()[0]}  exec: {sys.executable}")
-logger.info(f"🎬 FFmpeg: {FFMPEG_BIN}")
-logger.info(f"🔥 Torch: {TORCH_VER}  CUDA: {CUDA_OK}")
-logger.info('=' * 80)
-
-# ── Cleanup on exit ────────────────────────────────────────────────────────────
-def cleanup_temp_dirs():
-    try:
-        if os.path.exists(UPLOAD_FOLDER):
-            shutil.rmtree(UPLOAD_FOLDER)
-        if os.path.exists(OUTPUT_FOLDER):
-            shutil.rmtree(OUTPUT_FOLDER)
-        logger.info("🧹 Temp directories cleaned up")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-
-atexit.register(cleanup_temp_dirs)
-
-# ── Background worker ──────────────────────────────────────────────────────────
-def process_job_async(job_id, input_path, wav_path, callback_url, project_id, base44_app_id):
-    try:
-        logger.info(f"🎸 [{job_id}] Worker start")
-        logger.info(f"🔗 [{job_id}] Callback URL: {callback_url}")
-        logger.info(f"🆔 [{job_id}] Project ID: {project_id}")
-        logger.info(f"🆔 [{job_id}] App ID: {base44_app_id}")
-
-        # Demucs separation (explicit venv python)
-        demucs_cmd = [
-            sys.executable, '-m', 'demucs',
-            '-o', OUTPUT_FOLDER,
-            '-n', 'mdx_extra',
-            '--segment', '10',
-            '--jobs', '2',
-            wav_path
-        ]
-        logger.info(f"🔧 [{job_id}] Demucs: {' '.join(demucs_cmd)}")
-        demucs_res = subprocess.run(
-            demucs_cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800  # 30 minutes max
-        )
-        logger.debug(f"📤 [{job_id}] Demucs stdout:\n{demucs_res.stdout}")
-        logger.debug(f"📤 [{job_id}] Demucs stderr:\n{demucs_res.stderr}")
-        if demucs_res.returncode != 0:
-            raise Exception(f"Demucs failed: {demucs_res.stderr}")
-
-        # Expected output dir: OUTPUT_FOLDER/mdx_extra/<basename>
-        base_name = os.path.splitext(os.path.basename(wav_path))[0]
-        out_dir = os.path.join(OUTPUT_FOLDER, 'mdx_extra', base_name)
-        logger.info(f"📂 [{job_id}] Checking output dir: {out_dir}")
-        if not os.path.exists(out_dir):
-            logger.error(f"Contents of OUTPUT_FOLDER: {os.listdir(OUTPUT_FOLDER)}")
-            raise Exception(f"Output dir not found: {out_dir}")
-
-        # Collect stems -> base64
-        stem_files = {
-            'vocals': os.path.join(out_dir, 'vocals.wav'),
-            'drums':  os.path.join(out_dir, 'drums.wav'),
-            'bass':   os.path.join(out_dir, 'bass.wav'),
-            'other':  os.path.join(out_dir, 'other.wav'),
-        }
-        stems_b64 = {}
-        for name, path in stem_files.items():
-            if os.path.exists(path):
-                with open(path, 'rb') as f:
-                    b64 = base64.b64encode(f.read()).decode('utf-8')
-                stems_b64[name] = b64
-                logger.info(f"✅ [{job_id}] Encoded {name}")
-            else:
-                logger.warning(f"⚠️ [{job_id}] Missing stem: {name}")
-
-        if not stems_b64:
-            raise Exception("No stems generated by Demucs")
-
-        # Callback → Base44 handler
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {PYTHON_SERVICE_KEY}'
-        }
-        payload = {
-            'project_id': project_id,
-            'success': True,
-            'stems_base64': stems_b64
-        }
-        cb_resp = requests.post(callback_url, json=payload, headers=headers, timeout=120)
-        logger.info(f"📥 [{job_id}] Callback status: {cb_resp.status_code}")
-        logger.debug(f"📥 [{job_id}] Callback body: {cb_resp.text[:500]}")
-        if cb_resp.status_code != 200:
-            raise Exception(f"Callback failed: {cb_resp.status_code} {cb_resp.text[:200]}")
-
-        # Cleanup
+def _cleanup():
+    for p in (UPLOAD_DIR, OUTPUT_DIR):
         try:
-            if os.path.exists(input_path):
-                os.remove(input_path)
-            if os.path.exists(wav_path):
-                os.remove(wav_path)
-            if os.path.exists(out_dir):
-                shutil.rmtree(out_dir)
+            if os.path.exists(p):
+                shutil.rmtree(p, ignore_errors=True)
         except Exception as e:
-            logger.warning(f"Cleanup warn: {e}")
+            log.warning("Cleanup warning for %s: %s", p, e)
 
-        logger.info(f"🎉 [{job_id}] Done")
+atexit.register(_cleanup)
+
+# ────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ────────────────────────────────────────────────────────────────────────────
+def run(cmd: list[str]) -> None:
+    """Run a shell command, raising on non-zero exit with useful context."""
+    log.info("Exec: %s", " ".join(cmd))
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.stdout:
+        log.info("stdout: %s", res.stdout.strip()[:2000])
+    if res.stderr:
+        log.info("stderr: %s", res.stderr.strip()[:2000])
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed ({res.returncode}): {res.stderr}")
+
+def send_callback(callback_url: str, payload: dict) -> requests.Response:
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {PYTHON_SERVICE_KEY}",
+        "Base44-App-Id": BASE44_APP_ID,
+    }
+    log.info("POST -> %s  keys=%s", callback_url, list(payload.keys()))
+    resp = requests.post(callback_url, json=payload, headers=headers, timeout=120)
+    log.info("Callback status: %s", resp.status_code)
+    if resp.status_code != 200:
+        log.error("Callback body: %s", resp.text[:500])
+    return resp
+
+def encode_b64(path: str) -> str:
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+# ────────────────────────────────────────────────────────────────────────────
+# Worker
+# ────────────────────────────────────────────────────────────────────────────
+def worker(job_id: str, src_path: str, wav_path: str, callback_url: str, project_id: str):
+    try:
+        log.info("===== JOB %s START =====", job_id)
+        # Demucs → mdx_extra (balanced speed/quality) into OUTPUT_DIR
+        demucs_cmd = [
+            sys.executable, "-m", "demucs",
+            "-o", OUTPUT_DIR,
+            "-n", "mdx_extra",
+            "--segment", "10",
+            "--jobs", "2",
+            wav_path,
+        ]
+        run(demucs_cmd)
+
+        base = os.path.splitext(os.path.basename(wav_path))[0]
+        demucs_out = os.path.join(OUTPUT_DIR, "mdx_extra", base)
+        if not os.path.isdir(demucs_out):
+            raise RuntimeError(f"Demucs output missing: {demucs_out}")
+
+        # Expected stems
+        stems: Dict[str, str] = {
+            "vocals": os.path.join(demucs_out, "vocals.wav"),
+            "drums":  os.path.join(demucs_out, "drums.wav"),
+            "bass":   os.path.join(demucs_out, "bass.wav"),
+            "other":  os.path.join(demucs_out, "other.wav"),
+        }
+
+        # Send each stem as a separate (small) callback
+        for name, path in stems.items():
+            if not os.path.exists(path):
+                log.warning("Stem missing: %s", name)
+                continue
+            b64 = encode_b64(path)
+            resp = send_callback(callback_url, {
+                "project_id": project_id,
+                "success": True,
+                "mode": "partial",
+                "part": name,
+                "data_base64": b64,
+            })
+            if resp.status_code != 200:
+                raise RuntimeError(f"Partial callback failed for {name}: {resp.status_code}")
+
+        # Final “done” signal (lets Base44 mark completed)
+        done_resp = send_callback(callback_url, {
+            "project_id": project_id,
+            "success": True,
+            "mode": "done"
+        })
+        if done_resp.status_code != 200:
+            raise RuntimeError(f"Done callback failed: {done_resp.status_code}")
+
+        log.info("===== JOB %s OK =====", job_id)
 
     except Exception as e:
-        logger.error(f"❌ [{job_id}] FAIL: {e}")
-        # Send failure callback best-effort
+        log.exception("JOB %s FAILED: %s", job_id, e)
+        # Best-effort error callback
         try:
-            headers = {
-                'Content-Type': 'application/json',
-                'Authorization': f'Bearer {PYTHON_SERVICE_KEY}'
-            }
-            requests.post(
-                callback_url,
-                json={'project_id': project_id, 'success': False, 'error': str(e)},
-                headers=headers,
-                timeout=30
-            )
+            send_callback(callback_url, {
+                "project_id": project_id,
+                "success": False,
+                "error": str(e),
+            })
         except Exception as e2:
-            logger.error(f"Callback error: {e2}")
+            log.error("Failed to send error callback: %s", e2)
+    finally:
+        # local cleanup
+        for p in (src_path, wav_path):
+            try:
+                if p and os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
-@app.route('/separate_stems', methods=['POST'])
+# ────────────────────────────────────────────────────────────────────────────
+# Routes
+# ────────────────────────────────────────────────────────────────────────────
+@app.route("/separate_stems", methods=["POST"])
 def separate_stems():
     job_id = str(uuid.uuid4())[:8]
     try:
-        if 'file' not in request.files:
-            return jsonify({'error': 'No file provided'}), 400
+        f = request.files.get("file")
+        callback_url = request.form.get("callback_url")
+        project_id = request.form.get("project_id")
+        app_id_seen = request.form.get("base44_app_id")  # for logging only
 
-        file = request.files['file']
-        callback_url = request.form.get('callback_url')
-        project_id = request.form.get('project_id')
-        base44_app_id = request.form.get('base44_app_id')
+        if not f or not callback_url or not project_id:
+            return jsonify({"error": "Missing file, callback_url, or project_id"}), 400
 
-        # Validate basics
-        if not callback_url or not project_id or not base44_app_id:
-            return jsonify({'error': 'Missing callback_url, project_id, or base44_app_id'}), 400
-        u = urlparse(callback_url)
-        if u.scheme not in ('http', 'https') or not u.netloc:
-            return jsonify({'error': 'Invalid callback_url'}), 400
+        log.info("JOB %s new request", job_id)
+        log.info("Base44 app id (form): %s", app_id_seen)
+        log.info("Upload dir: %s", UPLOAD_DIR)
+        log.info("Output dir: %s", OUTPUT_DIR)
+        log.info("FFmpeg: %s", FFMPEG_BIN)
 
         # Save original
-        input_path = os.path.join(UPLOAD_FOLDER, f"{job_id}_{file.filename}")
-        file.save(input_path)
+        src_path = os.path.join(UPLOAD_DIR, f"{job_id}_{f.filename}")
+        f.save(src_path)
 
-        # Convert to WAV (44.1k/2ch)
-        wav_path = os.path.join(UPLOAD_FOLDER, f"{job_id}.wav")
+        # Convert to wav (44.1kHz, stereo)
+        wav_path = os.path.join(UPLOAD_DIR, f"{job_id}.wav")
         ffmpeg_cmd = [
-            FFMPEG_BIN, '-threads', '0',
-            '-i', input_path,
-            '-ar', '44100',
-            '-ac', '2',
-            '-loglevel', 'error',
-            '-y',
-            wav_path
+            FFMPEG_BIN, "-y",
+            "-i", src_path,
+            "-ar", "44100",
+            "-ac", "2",
+            "-loglevel", "error",
+            wav_path,
         ]
-        logger.info(f"🔧 [{job_id}] FFmpeg: {' '.join(ffmpeg_cmd)}")
-        ffm_res = subprocess.run(
-            ffmpeg_cmd,
-            capture_output=True,
-            text=True,
-            timeout=600  # 10 minutes
-        )
-        if ffm_res.returncode != 0:
-            return jsonify({'error': f'FFmpeg failed: {ffm_res.stderr}'}), 500
+        run(ffmpeg_cmd)
 
-        # Start background worker
-        thread = threading.Thread(
-            target=process_job_async,
-            args=(job_id, input_path, wav_path, callback_url, project_id, base44_app_id),
+        # Background process
+        th = threading.Thread(
+            target=worker,
+            args=(job_id, src_path, wav_path, callback_url, project_id),
             name=f"job-{job_id}",
-            daemon=True
+            daemon=True,
         )
-        thread.start()
+        th.start()
 
-        return jsonify({
-            'success': True,
-            'message': 'Job started',
-            'job_id': job_id,
-            'project_id': project_id
-        }), 202
+        return jsonify({"success": True, "job_id": job_id, "project_id": project_id}), 202
 
     except Exception as e:
-        # Best-effort notify callback of immediate failure
+        log.exception("REQUEST FAILED: %s", e)
+        # best effort immediate error callback if we can
         try:
-            if 'callback_url' in locals() and 'project_id' in locals():
-                headers = {'Content-Type': 'application/json', 'Authorization': f'Bearer {PYTHON_SERVICE_KEY}'}
-                requests.post(
-                    callback_url,
-                    json={'project_id': project_id, 'success': False, 'error': str(e)},
-                    headers=headers,
-                    timeout=30
-                )
+            if request.form.get("callback_url") and request.form.get("project_id"):
+                send_callback(request.form["callback_url"], {
+                    "project_id": request.form["project_id"],
+                    "success": False,
+                    "error": str(e),
+                })
         except Exception:
             pass
-        return jsonify({'error': str(e), 'error_type': type(e).__name__}), 500
+        return jsonify({"error": str(e), "error_type": type(e).__name__}), 500
 
-@app.route('/health', methods=['GET'])
+@app.route("/health", methods=["GET"])
 def health():
+    import torch  # lazy import; we only need the version
     return jsonify({
-        'status': 'healthy',
-        'service': 'audio-processing-service',
-        'python_version': sys.version.split()[0],
-        'torch_version': TORCH_VER,
-        'cuda_available': CUDA_OK
+        "status": "healthy",
+        "service": "audio-processing-service",
+        "python_version": sys.version.split()[0],
+        "torch_version": getattr(torch, "__version__", "unknown"),
+        "cuda_available": getattr(torch.cuda, "is_available", lambda: False)(),
     }), 200
 
-# ── Entrypoint ─────────────────────────────────────────────────────────────────
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    logger.info(f"🌐 Starting Flask server on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+# ────────────────────────────────────────────────────────────────────────────
+# Local run
+# ────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "8000"))
+    log.info("Starting on 0.0.0.0:%s", port)
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
+
 
 
 
