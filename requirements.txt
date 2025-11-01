@@ -3,4 +3,5 @@ requests==2.32.3
 demucs==4.0.1
 torch>=2.0.0
 gunicorn==21.2.0
+ffmpeg-python==0.2.0
 
