@@ -1,7 +1,13 @@
 flask==3.0.0
 requests==2.32.3
+gunicorn==21.2.0
+
+# Demucs inference stack
 demucs==4.0.1
 torch>=2.0.0
-gunicorn==21.2.0
+
+# I/O helpers
 ffmpeg-python==0.2.0
+soundfile==0.12.1
+numpy>=1.26
 
