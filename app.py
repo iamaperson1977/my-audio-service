@@ -162,6 +162,13 @@ def process_separation_task(job_id, input_path, original_filename):
 
         logger.info(f"[{job_id}] Stems directory: {stems_dir}")
 
+        # Rename 'other.wav' to 'guitar.wav' for consistency
+        other_path = os.path.join(stems_dir, 'other.wav')
+        guitar_path = os.path.join(stems_dir, 'guitar.wav')
+        if os.path.exists(other_path):
+            os.rename(other_path, guitar_path)
+            logger.info(f"[{job_id}] Renamed other.wav to guitar.wav")
+
         # Encode stems to base64
         stem_names = ['vocals', 'drums', 'bass', 'guitar']
         stems_data = {}
@@ -296,6 +303,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port, threaded=True)
+
 
 
 
