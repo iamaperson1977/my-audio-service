@@ -25,7 +25,7 @@ UPLOAD_FOLDER = '/tmp/uploads'
 OUTPUT_FOLDER = '/tmp/separated'
 JOBS_FOLDER = '/tmp/jobs'
 DEMUCS_MODEL = 'htdemucs_6s'
-SHIFTS = 5
+SHIFTS = 3
 
 # Ensure directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -268,6 +268,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port, threaded=True)
+
 
 
 
