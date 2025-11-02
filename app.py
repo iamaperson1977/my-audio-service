@@ -66,7 +66,9 @@ def load_job(job_id):
 def process_separation_task(job_id, input_path, original_filename):
     """Background task to process audio separation"""
     try:
-        logger.info(f"[{job_id}] Starting background processing")
+        logger.info(f"[{job_id}] ===== BACKGROUND TASK STARTED =====")
+        logger.info(f"[{job_id}] Input file: {input_path}")
+        logger.info(f"[{job_id}] File size: {os.path.getsize(input_path)} bytes")
         
         # Update status
         save_job(job_id, {
@@ -84,20 +86,46 @@ def process_separation_task(job_id, input_path, original_filename):
         save_job(job_id, {
             'status': 'processing',
             'progress': 20,
-            'message': 'Running AI separation (this takes 10-15 minutes)...',
+            'message': 'Running AI separation (this takes 6-10 minutes)...',
             'started_at': jobs[job_id]['started_at']
         })
 
         # Run Demucs separation
         logger.info(f"[{job_id}] Running Demucs with model={DEMUCS_MODEL}, shifts={SHIFTS}")
+        logger.info(f"[{job_id}] Command: python -m demucs -n {DEMUCS_MODEL} --shifts {SHIFTS}")
         
-        result = subprocess.run([
-            'python', '-m', 'demucs',
-            '-n', DEMUCS_MODEL,
-            '--shifts', str(SHIFTS),
-            '-o', job_output_dir,
-            input_path
-        ], check=True, capture_output=True, text=True)
+        try:
+            result = subprocess.run([
+                'python', '-m', 'demucs',
+                '-n', DEMUCS_MODEL,
+                '--shifts', str(SHIFTS),
+                '-o', job_output_dir,
+                input_path
+            ], check=True, capture_output=True, text=True, timeout=900)
+            
+            logger.info(f"[{job_id}] Demucs completed successfully!")
+            logger.info(f"[{job_id}] Demucs stdout: {result.stdout[:500]}")
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"[{job_id}] TIMEOUT ERROR: Demucs took longer than 15 minutes")
+            save_job(job_id, {
+                'status': 'failed',
+                'progress': 0,
+                'message': 'Processing timeout: Demucs exceeded 15 minutes. Try a shorter file.',
+                'error': 'TimeoutExpired'
+            })
+            return
+            
+        except subprocess.CalledProcessError as e:
+            logger.error(f"[{job_id}] DEMUCS CRASHED! Exit code: {e.returncode}")
+            logger.error(f"[{job_id}] Stderr: {e.stderr}")
+            save_job(job_id, {
+                'status': 'failed',
+                'progress': 0,
+                'message': f'Demucs processing failed: {e.stderr[:500]}',
+                'error': 'CalledProcessError'
+            })
+            return
 
         # Update progress
         save_job(job_id, {
@@ -174,7 +202,9 @@ def process_separation_task(job_id, input_path, original_filename):
         logger.info(f"[{job_id}] Completed successfully in {elapsed}s")
 
     except Exception as e:
-        logger.error(f"[{job_id}] Error: {e}")
+        logger.error(f"[{job_id}] Unexpected error: {e}")
+        import traceback
+        logger.error(f"[{job_id}] Traceback: {traceback.format_exc()}")
         save_job(job_id, {
             'status': 'failed',
             'progress': 0,
