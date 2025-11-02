@@ -163,7 +163,7 @@ def process_separation_task(job_id, input_path, original_filename):
         logger.info(f"[{job_id}] Stems directory: {stems_dir}")
 
         # Encode stems to base64
-        stem_names = ['vocals', 'drums', 'bass', 'other']
+        stem_names = ['vocals', 'drums', 'bass', 'guitar']
         stems_data = {}
         
         for stem_name in stem_names:
@@ -296,6 +296,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port, threaded=True)
+
 
 
 
