@@ -1,5 +1,5 @@
-# Use Python 3.10 slim image as base
-FROM python:3.10-slim-buster
+# Use Python 3.10 with Debian Bullseye (newer, still supported)
+FROM python:3.10-slim-bullseye
 
 # Set working directory
 WORKDIR /app
