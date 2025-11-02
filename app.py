@@ -1,150 +1,148 @@
 import os
 import uuid
 import subprocess
-import sys
-import json
 import base64
 import tempfile
-import shutil
+import json
 import logging
 import time
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-UPLOAD_FOLDER = tempfile.mkdtemp(prefix='audio_upload_')
-OUTPUT_FOLDER = tempfile.mkdtemp(prefix='audio_output_')
+# Configuration
+UPLOAD_FOLDER = '/tmp/uploads'
+OUTPUT_FOLDER = '/tmp/separated'
+DEMUCS_MODEL = 'htdemucs_6s'
+SHIFTS = 5
+TIMEOUT = 600  # 10 minutes
 
-@app.route('/separate_stems', methods=['POST'])
-def separate_stems():
-    input_path = None
-    output_dir = None
-    
-    try:
-        if 'file' not in request.files:
-            return jsonify({"error": "No audio file provided"}), 400
-        
-        file = request.files['file']
-        if file.filename == '':
-            return jsonify({"error": "Empty filename"}), 400
-        
-        unique_id = str(uuid.uuid4())
-        filename_parts = file.filename.rsplit('.', 1)
-        file_ext = filename_parts[1].lower() if len(filename_parts) > 1 else 'mp3'
-        
-        input_path = os.path.join(UPLOAD_FOLDER, f"{unique_id}_input.{file_ext}")
-        output_dir = os.path.join(OUTPUT_FOLDER, f"{unique_id}_stems")
-        
-        file.save(input_path)
-        logger.info(f"Saved: {input_path}")
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        logger.info(f"Running Demucs...")
-        start_time = time.time()
-        
-        subprocess.run([
-            sys.executable, '-m', 'demucs.separate',
-            '-n', 'htdemucs',
-            '-o', output_dir,
-            '--mp3',
-            '--mp3-bitrate', '192',
-            '--jobs', '2',
-            input_path
-        ], check=True, capture_output=True, text=True, timeout=600)
-        
-        processing_time = time.time() - start_time
-        logger.info(f"Demucs complete in {processing_time:.1f}s")
-        
-        stem_track_dir = os.path.join(output_dir, 'htdemucs', os.path.splitext(os.path.basename(input_path))[0])
-        
-        if not os.path.exists(stem_track_dir):
-            for root, dirs, files in os.walk(output_dir):
-                if any(f.endswith('.mp3') for f in files):
-                    stem_track_dir = root
-                    break
-        
-        logger.info(f"Stems directory: {stem_track_dir}")
+# Ensure directories exist
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-        stems_data = {}
-        for stem_name in ['vocals', 'drums', 'bass', 'other']:
-            stem_file = os.path.join(stem_track_dir, f"{stem_name}.mp3")
-            if os.path.exists(stem_file):
-                with open(stem_file, 'rb') as f:
-                    stems_data[stem_name] = base64.b64encode(f.read()).decode('utf-8')
-                logger.info(f"Encoded {stem_name}.mp3")
-        
-        if not stems_data:
-            raise ValueError("No stems were created")
-
-        logger.info(f"Success! Returning {len(stems_data)} stems")
-        return jsonify(stems_data), 200
-    
-    except subprocess.TimeoutExpired:
-        logger.error("Processing timeout")
-        return jsonify({"error": "Processing timeout - file too long"}), 500
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Demucs failed: {e.stderr}")
-        return jsonify({"error": "Stem separation failed", "details": str(e.stderr)[:200]}), 500
-    except Exception as e:
-        logger.error(f"Error: {e}")
-        return jsonify({"error": str(e)}), 500
-    finally:
-        try:
-            if input_path and os.path.exists(input_path):
-                os.remove(input_path)
-                logger.info(f"Cleaned up input: {input_path}")
-        except Exception as e:
-            logger.error(f"Failed to delete input: {e}")
-        
-        try:
-            if output_dir and os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
-                logger.info(f"Cleaned up output: {output_dir}")
-        except Exception as e:
-            logger.error(f"Failed to delete output: {e}")
 
 @app.route('/health', methods=['GET'])
 def health():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'model': DEMUCS_MODEL,
+        'shifts': SHIFTS,
+        'demucs': 'available',
+        'ffmpeg': 'available'
+    })
+
+
+@app.route('/separate_stems', methods=['POST'])
+def separate_stems():
+    """
+    Separate audio into stems using Demucs AI model.
+    Returns base64-encoded audio for each stem.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+    
+    file = request.files['file']
+    if not file.filename:
+        return jsonify({'error': 'Empty filename'}), 400
+
+    # Generate unique ID for this job
+    job_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{job_id}] Starting separation for: {file.filename}")
+    
+    start_time = time.time()
+    
     try:
-        result = subprocess.run(
-            [sys.executable, '-m', 'demucs', '--help'],
-            capture_output=True,
-            timeout=5
-        )
-        demucs_ok = result.returncode == 0
+        # Save uploaded file with unique name
+        file_ext = os.path.splitext(file.filename)[1]
+        temp_filename = f"{job_id}{file_ext}"
+        input_path = os.path.join(UPLOAD_FOLDER, temp_filename)
+        file.save(input_path)
         
-        ffmpeg_result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
-        ffmpeg_ok = ffmpeg_result.returncode == 0
+        logger.info(f"[{job_id}] File saved: {input_path}")
+
+        # Prepare output directory
+        job_output_dir = os.path.join(OUTPUT_FOLDER, job_id)
+        os.makedirs(job_output_dir, exist_ok=True)
+
+        # Run Demucs separation
+        logger.info(f"[{job_id}] Running Demucs with model={DEMUCS_MODEL}, shifts={SHIFTS}")
         
-        return jsonify({
-            "status": "healthy",
-            "demucs": "available" if demucs_ok else "unavailable",
-            "ffmpeg": "available" if ffmpeg_ok else "unavailable"
-        }), 200
+        subprocess.run([
+            'python', '-m', 'demucs',
+            '-n', DEMUCS_MODEL,
+            '--shifts', str(SHIFTS),
+            '-o', job_output_dir,
+            input_path
+        ], check=True, timeout=TIMEOUT)
+
+        # Locate separated stems
+        base_name = os.path.splitext(temp_filename)[0]
+        stems_dir = os.path.join(job_output_dir, DEMUCS_MODEL, base_name)
+
+        if not os.path.exists(stems_dir):
+            raise FileNotFoundError(f"Output directory not found: {stems_dir}")
+
+        logger.info(f"[{job_id}] Stems directory: {stems_dir}")
+
+        # Encode stems to base64
+        stem_names = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other']
+        stems = {}
+        
+        for stem_name in stem_names:
+            stem_path = os.path.join(stems_dir, f'{stem_name}.wav')
+            
+            if os.path.exists(stem_path):
+                file_size = os.path.getsize(stem_path)
+                logger.info(f"[{job_id}] Encoding {stem_name}: {file_size} bytes")
+                
+                with open(stem_path, 'rb') as f:
+                    stems[stem_name] = base64.b64encode(f.read()).decode('utf-8')
+            else:
+                logger.warning(f"[{job_id}] Missing stem: {stem_name}")
+                stems[stem_name] = None
+
+        # Cleanup
+        if os.path.exists(input_path):
+            os.remove(input_path)
+        if os.path.exists(job_output_dir):
+            import shutil
+            shutil.rmtree(job_output_dir)
+
+        elapsed = round(time.time() - start_time, 2)
+        logger.info(f"[{job_id}] Completed in {elapsed}s")
+
+        return jsonify(stems)
+
+    except subprocess.TimeoutExpired:
+        logger.error(f"[{job_id}] Timeout after {TIMEOUT}s")
+        return jsonify({'error': 'Processing timeout (10 minutes exceeded)'}), 504
+    
+    except subprocess.CalledProcessError as e:
+        logger.error(f"[{job_id}] Demucs error: {e}")
+        return jsonify({'error': f'Separation failed: {str(e)}'}), 500
+    
     except Exception as e:
-        return jsonify({"status": "unhealthy", "error": str(e)}), 500
+        logger.error(f"[{job_id}] Unexpected error: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 if __name__ == '__main__':
-    import atexit
-    
-    def cleanup():
-        for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
-            if os.path.exists(folder):
-                try:
-                    shutil.rmtree(folder)
-                except Exception as e:
-                    logger.error(f"Cleanup error: {e}")
-    
-    atexit.register(cleanup)
-    
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"Starting server on port {port}")
+    app.run(host='0.0.0.0', port=port)
+
 
 
 
