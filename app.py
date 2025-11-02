@@ -25,7 +25,7 @@ UPLOAD_FOLDER = '/tmp/uploads'
 OUTPUT_FOLDER = '/tmp/separated'
 DEMUCS_MODEL = 'htdemucs_6s'
 SHIFTS = 5
-TIMEOUT = 600  # 10 minutes
+TIMEOUT = 1200  # 20 minutes
 
 # Ensure directories exist
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -127,7 +127,7 @@ def separate_stems():
 
     except subprocess.TimeoutExpired:
         logger.error(f"[{job_id}] Timeout after {TIMEOUT}s")
-        return jsonify({'error': 'Processing timeout (10 minutes exceeded)'}), 504
+        return jsonify({'error': 'Processing timeout (20 minutes exceeded)'}), 504
     
     except subprocess.CalledProcessError as e:
         logger.error(f"[{job_id}] Demucs error: {e}")
