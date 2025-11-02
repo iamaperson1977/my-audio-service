@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 UPLOAD_FOLDER = '/tmp/uploads'
 OUTPUT_FOLDER = '/tmp/separated'
 JOBS_FOLDER = '/tmp/jobs'
-DEMUCS_MODEL = 'htdemucs_6s'
+DEMUCS_MODEL = 'htdemucs'
 SHIFTS = 2
 
 # Ensure directories exist
@@ -86,7 +86,7 @@ def process_separation_task(job_id, input_path, original_filename):
         save_job(job_id, {
             'status': 'processing',
             'progress': 20,
-            'message': 'Running AI separation (this takes 6-10 minutes)...',
+            'message': 'Running AI separation (this takes 3-5 minutes)...',
             'started_at': jobs[job_id]['started_at']
         })
 
@@ -163,7 +163,7 @@ def process_separation_task(job_id, input_path, original_filename):
         logger.info(f"[{job_id}] Stems directory: {stems_dir}")
 
         # Encode stems to base64
-        stem_names = ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other']
+        stem_names = ['vocals', 'drums', 'bass', 'other']
         stems_data = {}
         
         for stem_name in stem_names:
@@ -202,9 +202,7 @@ def process_separation_task(job_id, input_path, original_filename):
         logger.info(f"[{job_id}] Completed successfully in {elapsed}s")
 
     except Exception as e:
-        logger.error(f"[{job_id}] Unexpected error: {e}")
-        import traceback
-        logger.error(f"[{job_id}] Traceback: {traceback.format_exc()}")
+        logger.error(f"[{job_id}] Error: {e}")
         save_job(job_id, {
             'status': 'failed',
             'progress': 0,
@@ -251,7 +249,7 @@ def start_separation():
         save_job(job_id, {
             'status': 'queued',
             'progress': 0,
-            'message': 'Job queued...',
+            'message': 'Job queued...', 
             'filename': file.filename
         })
 
@@ -298,6 +296,7 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     logger.info(f"Starting server on port {port}")
     app.run(host='0.0.0.0', port=port, threaded=True)
+
 
 
 
